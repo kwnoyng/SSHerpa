@@ -1,0 +1,13 @@
+# Git stores text as LF in the repository. The working tree gets the platform's
+# native line endings unless overridden below.
+* text=auto
+
+# Must stay LF: Linux tooling reads these directly, and a shell script checked
+# out with CRLF fails at its shebang.
+*.sh          text eol=lf
+Dockerfile*   text eol=lf
+*.yml         text eol=lf
+*.py          text eol=lf
+
+# Windows-only script.
+*.ps1         text eol=crlf
