@@ -1,0 +1,26 @@
+# RedHat 계열 테스트 타겟 (Rocky Linux)
+ARG BASE=rockylinux/rockylinux:9
+FROM ${BASE}
+
+ARG USERNAME=admin
+ARG WITH_SUDO=yes
+
+RUN dnf install -y openssh-server sudo && dnf clean all
+
+RUN useradd -m -s /bin/bash ${USERNAME} \
+ && mkdir -p /home/${USERNAME}/.ssh
+
+RUN if [ "${WITH_SUDO}" = "yes" ]; then \
+      echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ssherpa-test \
+      && chmod 440 /etc/sudoers.d/ssherpa-test ; \
+    fi
+
+COPY id_test.pub /home/${USERNAME}/.ssh/authorized_keys
+RUN chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.ssh \
+ && chmod 700 /home/${USERNAME}/.ssh \
+ && chmod 600 /home/${USERNAME}/.ssh/authorized_keys
+
+RUN mkdir -p /run/sshd && ssh-keygen -A
+
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]

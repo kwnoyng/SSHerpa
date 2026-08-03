@@ -1,0 +1,72 @@
+# SSHerpa v0.1 테스트 타겟.
+#
+# v0.1 이 검사하는 것은 SSH 연결 / sudo / /etc/os-release 뿐이라
+# 실제 VM 없이 컨테이너로 완전히 재현된다.
+# (VM 생성이 들어가는 v0.2 부터는 진짜 머신이 필요하다)
+
+services:
+  # 기대: 전부 통과
+  ubuntu24:
+    build:
+      context: .
+      dockerfile: Dockerfile.deb
+      args:
+        BASE: "ubuntu:24.04"
+        USERNAME: admin
+        WITH_SUDO: "yes"
+    ports: ["2201:22"]
+
+  # 기대: 전부 통과 (family: RedHat)
+  rocky9:
+    build:
+      context: .
+      dockerfile: Dockerfile.rhel
+      args:
+        BASE: "rockylinux/rockylinux:9"
+        USERNAME: admin
+        WITH_SUDO: "yes"
+    ports: ["2202:22"]
+
+  # 기대: 전부 통과. 지원한다고 선언한 버전은 전부 실제로 붙어봐야 한다.
+  ubuntu22:
+    build:
+      context: .
+      dockerfile: Dockerfile.deb
+      args:
+        BASE: "ubuntu:22.04"
+        USERNAME: admin
+        WITH_SUDO: "yes"
+    ports: ["2205:22"]
+
+  # 기대: 전부 통과. RedHat 계열 경로가 Rocky 전용이 아님을 확인한다.
+  alma9:
+    build:
+      context: .
+      dockerfile: Dockerfile.rhel
+      args:
+        BASE: "almalinux:9"
+        USERNAME: admin
+        WITH_SUDO: "yes"
+    ports: ["2206:22"]
+
+  # 기대: sudo 권한 검사에서 실패
+  ubuntu24-nosudo:
+    build:
+      context: .
+      dockerfile: Dockerfile.deb
+      args:
+        BASE: "ubuntu:24.04"
+        USERNAME: nosudo
+        WITH_SUDO: "no"
+    ports: ["2203:22"]
+
+  # 기대: 지원 여부 검사에서 실패 (지원하지 않는 버전)
+  ubuntu20:
+    build:
+      context: .
+      dockerfile: Dockerfile.deb
+      args:
+        BASE: "ubuntu:20.04"
+        USERNAME: admin
+        WITH_SUDO: "yes"
+    ports: ["2204:22"]

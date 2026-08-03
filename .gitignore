@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# 테스트 전용 SSH 키 (verify.ps1 이 자동 생성)
+tests/docker/id_test
+tests/docker/id_test.pub

@@ -1,0 +1,29 @@
+# Debian 계열 테스트 타겟 (Ubuntu)
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+
+ARG USERNAME=admin
+ARG WITH_SUDO=yes
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server sudo \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash ${USERNAME} \
+ && mkdir -p /home/${USERNAME}/.ssh
+
+# WITH_SUDO=no 인 컨테이너는 'sudo 권한 없음' 케이스를 재현한다.
+RUN if [ "${WITH_SUDO}" = "yes" ]; then \
+      echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ssherpa-test \
+      && chmod 440 /etc/sudoers.d/ssherpa-test ; \
+    fi
+
+COPY id_test.pub /home/${USERNAME}/.ssh/authorized_keys
+RUN chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.ssh \
+ && chmod 700 /home/${USERNAME}/.ssh \
+ && chmod 600 /home/${USERNAME}/.ssh/authorized_keys
+
+RUN mkdir -p /run/sshd && ssh-keygen -A
+
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]

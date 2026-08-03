@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ssherpa"
+version = "0.1.0"
+description = "Build lab environments on on-premises servers"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+    "PyYAML>=6",
+]
+
+[project.urls]
+Homepage = "https://github.com/kwnoyng/SSHerpa"
+Issues = "https://github.com/kwnoyng/SSHerpa/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+ssherpa = "ssherpa.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ssherpa"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["F", "E", "I", "UP", "B", "SIM", "ARG"]
