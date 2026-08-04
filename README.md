@@ -24,13 +24,19 @@ non-interactively, so it uses public-key authentication only.
 ## Install
 
 ```bash
-pip install git+https://github.com/kwnoyng/SSHerpa.git
+pip install ssherpa
 ```
 
-Or, for an isolated install:
+Or, for an isolated install (recommended for CLI tools):
 
 ```bash
-pipx install git+https://github.com/kwnoyng/SSHerpa.git
+pipx install ssherpa
+```
+
+To try the latest unreleased changes instead:
+
+```bash
+pip install git+https://github.com/kwnoyng/SSHerpa.git@develop
 ```
 
 ## Usage
