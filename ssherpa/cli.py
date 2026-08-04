@@ -1,15 +1,22 @@
 """SSHerpa CLI 진입점."""
 
 import contextlib
+import os
+import shutil
+import subprocess
 import sys
+import time
 from typing import Optional
 
+import questionary
 import typer
 from rich.console import Console
 from rich.padding import Padding
 from rich.table import Table
 
-from . import __version__, facts, support
+from . import __version__, cluster, facts, support
+from . import distro as distro_mod
+from .cluster import ClusterError
 from .inventory import (
     InventoryError,
     add_target,
@@ -83,6 +90,34 @@ def _fail(message: str, hints: Optional[list[str]] = None) -> None:
             err_console.print(Padding(hint, (0, 0, 0, 4)))
     err_console.print()
     raise typer.Exit(code=1)
+
+
+class StepReporter:
+    """단계별 진행 표시.
+
+    설치는 수십 초가 걸린다. 그동안 화면이 멈춰 있으면 사용자는 진행 중인지
+    죽은 건지 알 수 없으므로, 실행 중에는 스피너를 돌리고 끝나면 걸린 시간을
+    남긴다.
+    """
+
+    def __init__(self, console: Console):
+        self.console = console
+
+    @contextlib.contextmanager
+    def step(self, label: str):
+        started = time.monotonic()
+        try:
+            with self.console.status(f"[dim]{label}[/dim]", spinner="dots"):
+                yield
+        except BaseException:
+            self.console.print(
+                Padding(f"[red]✗[/red] {label}", (0, 0, 0, 4))
+            )
+            raise
+        elapsed = time.monotonic() - started
+        self.console.print(
+            Padding(f"[green]✓[/green] {label:<22}[dim]{elapsed:6.1f}s[/dim]", (0, 0, 0, 4))
+        )
 
 
 # --------------------------------------------------------------------------
@@ -331,6 +366,345 @@ def check(
     console.print()
     console.print(Padding(f"[bold green]{label} is ready[/bold green]", (0, 0, 0, 2)))
     console.print()
+
+
+# --------------------------------------------------------------------------
+# up / down / ssh 명령
+# --------------------------------------------------------------------------
+
+def _resolve_distro(name: str):
+    chosen = distro_mod.get(name)
+    if chosen is None:
+        _fail(
+            f"Unknown distribution: {name}",
+            [f"Available: {distro_mod.names()}"],
+        )
+    return chosen
+
+
+def _interactive() -> bool:
+    """사람이 앉아 있는 터미널인지.
+
+    stdin 만 보면 안 된다. 출력을 파이프로 넘기면 stdin 은 여전히 TTY 지만
+    화면 제어가 불가능해서 프롬프트가 터진다.
+    """
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _prompt_for_distro():
+    """설치할 배포판을 화살표로 고르게 한다. 대화형 터미널에서만 호출된다."""
+    options = list(distro_mod.DISTROS.values())
+    try:
+        answer = questionary.select(
+            "Which Kubernetes distribution?",
+            choices=[
+                questionary.Choice(title=f"{o.name:<6} {o.summary}", value=o.name)
+                for o in options
+            ],
+        ).ask()
+    except Exception:  # 프롬프트를 띄울 수 없는 터미널
+        return options[0]
+
+    if answer is None:  # Ctrl+C
+        raise typer.Exit(code=1)
+    return _resolve_distro(answer)
+
+
+def _confirm(question: str, *, assume_yes: bool) -> bool:
+    """파괴적이거나 놀랄 수 있는 동작 전에 한 번 묻는다."""
+    if assume_yes or not _interactive():
+        return True
+    try:
+        return bool(questionary.confirm(question, default=False).ask())
+    except Exception:  # 프롬프트를 띄울 수 없으면 막지 않는다
+        return True
+
+
+def _installed_on(node) -> list[str]:
+    """호스트에 설치된 배포판 이름 목록."""
+    try:
+        host = cluster.status(node, list(distro_mod.DISTROS.values()))
+    except SSHError as exc:
+        _fail(exc.message, exc.hints)
+    return [d.name for d in host.installed]
+
+
+def _distro_to_install(node):
+    """설치 대상을 정한다.
+
+    한 호스트에는 배포판 하나만 존재할 수 있다(모두 6443 과 /etc/rancher 를
+    공유한다). 그래서 고를 일이 생기는 건 '아무것도 없을 때' 뿐이고, 그때만
+    물어본다. 이미 있으면 그것을 그대로 따르므로 충돌이 발생할 수 없다.
+    """
+    installed = _installed_on(node)
+
+    if len(installed) > 1:
+        _fail(
+            "More than one distribution is installed on this host",
+            [
+                "They cannot coexist — remove them and start clean:",
+                f"    ssherpa down {node.target.name}",
+            ],
+        )
+
+    if installed:
+        return _resolve_distro(installed[0])
+
+    # 스크립트로 실행되면 물어볼 수 없으므로 가벼운 쪽을 쓴다.
+    if not _interactive():
+        return _resolve_distro("k3s")
+
+    return _prompt_for_distro()
+
+
+def _load_target(name: str) -> Target:
+    try:
+        return get_target(name)
+    except InventoryError as exc:
+        _fail(str(exc))
+
+
+@app.command("up")
+def up(
+    name: str = typer.Argument(..., help="Registered target name"),
+    assume_yes: bool = typer.Option(
+        False, "--yes", "-y", help="Do not ask for confirmation"
+    ),
+) -> None:
+    """Install Kubernetes on a target host.
+
+    Asks which distribution to install when the host is empty. If one is
+    already installed it is detected and left alone, so re-running is safe.
+    """
+    target = _load_target(name)
+    node = cluster.nodes_for_host_mode(target)[0]
+    already_installed = _installed_on(node)
+
+    if already_installed:
+        console.print()
+        console.print(
+            Padding(
+                f"[yellow]{already_installed[0]}[/yellow] is already installed "
+                f"on [bold]{name}[/bold].",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print(
+            Padding(
+                "[dim]Re-running will wait for the node and refresh the kubeconfig. "
+                "Nothing is reinstalled.[/dim]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
+        if not _confirm("Continue?", assume_yes=assume_yes):
+            raise typer.Exit(code=1)
+
+    chosen = _distro_to_install(node)
+
+    console.print()
+    console.print(
+        Padding(f"Installing [bold]{chosen.name}[/bold] on [bold]{name}[/bold]", (0, 0, 0, 2))
+    )
+    console.print()
+
+    try:
+        result = cluster.up(node, chosen, StepReporter(console))
+    except SSHError as exc:
+        _fail(exc.message, exc.hints)
+    except ClusterError as exc:
+        _fail(exc.message, exc.hints)
+
+    console.print()
+    if result.already_installed:
+        console.print(
+            Padding(f"[dim]{chosen.name} was already installed — left as is.[/dim]", (0, 0, 0, 2))
+        )
+    console.print(Padding("[bold green]Cluster ready[/bold green]", (0, 0, 0, 2)))
+    console.print(Padding(f"[dim]kubeconfig: {result.kubeconfig}[/dim]", (0, 0, 0, 2)))
+    console.print()
+
+    if result.api_reachable:
+        console.print(Padding("Use it with:", (0, 0, 0, 2)))
+        console.print(
+            Padding(f"[dim]$env:KUBECONFIG=\"{result.kubeconfig}\"; kubectl get nodes[/dim]",
+                    (0, 0, 0, 4))
+        )
+    else:
+        # 포트가 막힌 것은 흔한 정상 상황이다. 실패로 처리하지 않고 방법을 안내한다.
+        console.print(
+            Padding(
+                f"[yellow]Port {cluster.API_PORT} is not reachable from here.[/yellow]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
+        console.print(Padding("Open an SSH tunnel in another terminal:", (0, 0, 0, 4)))
+        console.print(
+            Padding(
+                f"[dim]ssh -L {cluster.API_PORT}:127.0.0.1:{cluster.API_PORT} "
+                f"{target.user}@{target.host}[/dim]",
+                (0, 0, 0, 6),
+            )
+        )
+        console.print()
+        console.print(Padding("then point kubectl at the tunnel:", (0, 0, 0, 4)))
+        console.print(
+            Padding(
+                f"[dim]$env:KUBECONFIG=\"{result.kubeconfig}\"; "
+                f"kubectl --server https://127.0.0.1:{cluster.API_PORT} get nodes[/dim]",
+                (0, 0, 0, 6),
+            )
+        )
+        console.print()
+        console.print(
+            Padding(
+                "[dim]Opening the port to the internet instead would expose the "
+                "cluster API — restrict it to your own address if you do.[/dim]",
+                (0, 0, 0, 4),
+            )
+        )
+    console.print()
+
+
+@app.command("status")
+def status(
+    name: str = typer.Argument(..., help="Registered target name"),
+) -> None:
+    """Show what Kubernetes is installed and running on a target."""
+    target = _load_target(name)
+    node = cluster.nodes_for_host_mode(target)[0]
+    known = list(distro_mod.DISTROS.values())
+
+    try:
+        host = cluster.status(node, known)
+    except SSHError as exc:
+        _fail(exc.message, exc.hints)
+
+    table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
+    table.add_column(no_wrap=True, style="bold")
+    table.add_column(no_wrap=True)
+    table.add_column(overflow="fold")
+    for entry in host.distros:
+        if not entry.installed:
+            table.add_row(entry.name, "[dim]—[/dim]", "[dim]not installed[/dim]")
+            continue
+        colour = "green" if entry.running else "yellow"
+        state = entry.service_state or "unknown"
+        table.add_row(entry.name, "[green]✓[/green]", f"installed  [{colour}]{state}[/{colour}]")
+
+    console.print()
+    console.print(Padding(f"Status of [bold]{name}[/bold]", (0, 0, 0, 2)))
+    console.print()
+    console.print(Padding(table, (0, 0, 0, 2)))
+    console.print()
+
+    if host.node_line:
+        console.print(Padding(f"[dim]node:[/dim]  {host.node_line}", (0, 0, 0, 2)))
+        console.print()
+
+    if host.conflicted:
+        # 두 배포판이 함께 있으면 둘 다 6443 을 잡으려 해서 나중 것이 못 뜬다.
+        extra = [d.name for d in host.installed if not d.running]
+        err_console.print(
+            Padding(
+                "[yellow]More than one distribution is installed.[/yellow]",
+                (0, 0, 0, 2),
+            )
+        )
+        err_console.print()
+        err_console.print(
+            Padding(
+                "They all bind port 6443, so only one can run. Remove the others:",
+                (0, 0, 0, 4),
+            )
+        )
+        for other in extra or [d.name for d in host.installed[1:]]:
+            err_console.print(
+                Padding(f"[dim]ssherpa down {name} --distro {other}[/dim]", (0, 0, 0, 8))
+            )
+        err_console.print()
+    elif not host.installed:
+        console.print(Padding(f"[dim]Nothing installed.  ssherpa up {name}[/dim]", (0, 0, 0, 2)))
+        console.print()
+
+
+@app.command("down")
+def down(
+    name: str = typer.Argument(..., help="Registered target name"),
+    assume_yes: bool = typer.Option(
+        False, "--yes", "-y", help="Do not ask for confirmation"
+    ),
+) -> None:
+    """Remove Kubernetes from a target host.
+
+    Whatever is installed is detected and removed — there is nothing to choose,
+    since a host can only run one distribution.
+    """
+    target = _load_target(name)
+    node = cluster.nodes_for_host_mode(target)[0]
+    installed = _installed_on(node)
+
+    if not installed:
+        console.print()
+        console.print(Padding("[dim]Nothing is installed on this host.[/dim]", (0, 0, 0, 2)))
+        console.print()
+        return
+
+    # 클러스터를 통째로 없애는 동작이라 되돌릴 수 없다.
+    console.print()
+    console.print(
+        Padding(
+            f"This removes [bold]{', '.join(installed)}[/bold] from [bold]{name}[/bold] "
+            "and destroys the cluster.",
+            (0, 0, 0, 2),
+        )
+    )
+    console.print(Padding("[dim]Workloads and cluster state are lost.[/dim]", (0, 0, 0, 2)))
+    console.print()
+    if not _confirm("Continue?", assume_yes=assume_yes):
+        raise typer.Exit(code=1)
+
+    console.print()
+
+    for distro_name in installed:
+        chosen = _resolve_distro(distro_name)
+        try:
+            cluster.down(node, chosen, StepReporter(console))
+        except SSHError as exc:
+            _fail(exc.message, exc.hints)
+        except ClusterError as exc:
+            _fail(exc.message, exc.hints)
+
+    console.print()
+    console.print(Padding("[bold green]Removed[/bold green]", (0, 0, 0, 2)))
+    console.print()
+
+
+@app.command(
+    "ssh",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def ssh_cmd(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Registered target name"),
+) -> None:
+    """Open an interactive SSH session to a target.
+
+    Extra arguments are passed straight through to ssh.
+    """
+    target = _load_target(name)
+
+    if shutil.which("ssh") is None:
+        _fail("ssh client not found")
+
+    argv = ["ssh", "-p", str(target.port)]
+    if target.key:
+        argv += ["-i", os.path.expanduser(target.key)]
+    argv += [f"{target.user}@{target.host}", *ctx.args]
+
+    # 대화형 세션이므로 출력을 가로채지 않고 그대로 넘긴다.
+    raise typer.Exit(code=subprocess.call(argv))
 
 
 # --------------------------------------------------------------------------

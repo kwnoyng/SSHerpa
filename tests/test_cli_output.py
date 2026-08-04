@@ -59,6 +59,54 @@ class TestLegacyEncoding:
         assert "UnicodeEncodeError" not in result.stderr
 
 
+class TestPromptSafety:
+    """출력이 파이프로 넘어가면 프롬프트를 띄울 수 없다.
+
+    stdin 만 확인하면 안 된다. `ssherpa up lab | tee log.txt` 처럼 쓰면
+    stdin 은 여전히 TTY 지만 화면 제어가 불가능해 프롬프트가 죽는다.
+    """
+
+    def test_needs_both_streams(self, monkeypatch):
+        from ssherpa import cli
+
+        class Stream:
+            def __init__(self, tty):
+                self._tty = tty
+
+            def isatty(self):
+                return self._tty
+
+        monkeypatch.setattr(cli.sys, "stdin", Stream(True))
+        monkeypatch.setattr(cli.sys, "stdout", Stream(False))
+        assert cli._interactive() is False
+
+        monkeypatch.setattr(cli.sys, "stdout", Stream(True))
+        assert cli._interactive() is True
+
+    def test_confirm_does_not_block_when_not_interactive(self, monkeypatch):
+        from ssherpa import cli
+
+        monkeypatch.setattr(cli, "_interactive", lambda: False)
+        assert cli._confirm("Continue?", assume_yes=False) is True
+
+    def test_confirm_skipped_with_yes_flag(self, monkeypatch):
+        from ssherpa import cli
+
+        monkeypatch.setattr(cli, "_interactive", lambda: True)
+        # 프롬프트를 띄우면 테스트가 멈추므로, --yes 는 그 전에 빠져나가야 한다
+        assert cli._confirm("Continue?", assume_yes=True) is True
+
+    def test_broken_terminal_does_not_crash(self, monkeypatch):
+        from ssherpa import cli
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("No Windows console found")
+
+        monkeypatch.setattr(cli, "_interactive", lambda: True)
+        monkeypatch.setattr(cli.questionary, "confirm", explode)
+        assert cli._confirm("Continue?", assume_yes=False) is True
+
+
 class TestExitCodes:
     """verify.ps1 / verify.sh 가 종료 코드로 판정하므로 계약이 고정돼야 한다."""
 

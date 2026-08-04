@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ssherpa"
-version = "0.1.0"
+version = "0.2.0"
 description = "Build lab environments on on-premises servers"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,6 +14,7 @@ dependencies = [
     "typer>=0.12",
     "rich>=13",
     "PyYAML>=6",
+    "questionary>=2",
 ]
 
 [project.urls]
