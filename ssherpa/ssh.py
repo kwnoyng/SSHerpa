@@ -178,11 +178,18 @@ def _classify(stderr: str, target: Target) -> SSHError:
     )
 
 
-def run(target: Target, remote_command: str) -> CommandResult:
+def run(
+    target: Target,
+    remote_command: str,
+    timeout: int = COMMAND_TIMEOUT,
+) -> CommandResult:
     """원격 명령을 실행한다.
 
     연결 자체가 실패하면 SSHError 를 던지고,
     연결은 됐지만 명령이 실패한 경우는 CommandResult 로 돌려준다.
+
+    timeout 은 명령마다 다르다. 상태 조회는 몇 초면 끝나지만 쿠버네티스
+    설치는 이미지 내려받기까지 포함해 수 분이 걸린다.
     """
     if shutil.which("ssh") is None:
         raise SSHError(
@@ -200,12 +207,19 @@ def run(target: Target, remote_command: str) -> CommandResult:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=COMMAND_TIMEOUT,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
         raise SSHError(
-            f"no response (timed out after {COMMAND_TIMEOUT}s)",
-            [f"Check the state of {target.host}"],
+            f"no response (timed out after {timeout}s)",
+            [
+                # 무거운 작업(설치·제거) 직후에는 호스트가 잠시 느려질 수 있다.
+                "The host accepted the connection but did not finish in time.",
+                "This is often temporary — a busy host right after an install or",
+                "uninstall. Try the command again.",
+                "",
+                f"If it keeps happening, check the host:  ssh {target.user}@{target.host}",
+            ],
         ) from exc
 
     if proc.returncode == SSH_FAILURE_RC:

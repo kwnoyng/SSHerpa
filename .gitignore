@@ -6,6 +6,8 @@ dist/
 .venv/
 venv/
 .pytest_cache/
+.idea/
+.vscode/
 
 # 테스트 전용 SSH 키 (verify.ps1 이 자동 생성)
 tests/docker/id_test
