@@ -251,6 +251,72 @@ class TestCertificateCoverage:
         assert f"systemctl restart {chosen.service}" in step.command
 
 
+class TestUpHealOrchestration:
+    """up() 이 인증서 불일치를 만나면 치유 → 재검증까지 스스로 해야 한다.
+
+    부품(certificate_covers, refresh step)은 실서버에서 검증했지만,
+    가짜 주소로는 SSH 가 안 되므로 분기 자체는 여기서 mock 으로 돈다.
+    """
+
+    def _wire(self, monkeypatch, coverage_answers):
+        """up() 의 원격 의존을 전부 가짜로 바꾼다."""
+        calls = {"steps": [], "coverage": list(coverage_answers)}
+
+        monkeypatch.setattr(cluster, "is_installed", lambda *_a: True)
+        monkeypatch.setattr(cluster, "wait_for_ready", lambda *_a: None)
+        monkeypatch.setattr(cluster, "api_reachable", lambda *_a, **_k: True)
+        monkeypatch.setattr(
+            cluster, "fetch_kubeconfig", lambda *_a: cluster.kubeconfig_path("t")
+        )
+        monkeypatch.setattr(
+            cluster,
+            "certificate_covers",
+            lambda *_a: calls["coverage"].pop(0),
+        )
+        monkeypatch.setattr(
+            cluster,
+            "_run_step",
+            lambda _node, step: calls["steps"].append(step.label),
+        )
+        return calls
+
+    def test_mismatch_triggers_refresh_and_reports_it(self, monkeypatch):
+        calls = self._wire(monkeypatch, coverage_answers=[False, True])
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+
+        result = cluster.up(node, distro_mod.get("k3s"))
+
+        assert calls["steps"] == ["refresh certificate"]
+        assert result.certificate_refreshed is True
+
+    def test_matching_certificate_is_left_alone(self, monkeypatch):
+        calls = self._wire(monkeypatch, coverage_answers=[True])
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+
+        result = cluster.up(node, distro_mod.get("k3s"))
+
+        assert calls["steps"] == []
+        assert result.certificate_refreshed is False
+
+    def test_indeterminate_certificate_does_not_block(self, monkeypatch):
+        # openssl 이 없어 판단 불가(None)면 치유를 시도하지 않고 진행한다
+        calls = self._wire(monkeypatch, coverage_answers=[None])
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+
+        result = cluster.up(node, distro_mod.get("k3s"))
+
+        assert calls["steps"] == []
+        assert result.certificate_refreshed is False
+
+    def test_failed_heal_raises_instead_of_lying(self, monkeypatch):
+        # 치유했는데도 인증서가 그대로면 'Cluster ready' 라고 하면 안 된다
+        self._wire(monkeypatch, coverage_answers=[False, False])
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+
+        with pytest.raises(cluster.ClusterError, match="still does not cover"):
+            cluster.up(node, distro_mod.get("k3s"))
+
+
 class TestRewriteKubeconfig:
     """127.0.0.1 그대로 두면 내 PC 에서 kubectl 이 자기 자신에게 접속한다."""
 
