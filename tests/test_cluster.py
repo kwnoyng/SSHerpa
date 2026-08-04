@@ -54,14 +54,28 @@ class TestInstallSteps:
         steps = distro_mod.get(name).install_steps("h")
         assert max(step.timeout for step in steps) >= 300
 
-    def test_k3s_is_a_single_step(self):
-        assert len(distro_mod.get("k3s").install_steps("h")) == 1
+    def test_k3s_configures_before_installing(self):
+        # config.yaml 이 설치보다 먼저 있어야 첫 기동 인증서에 SAN 이 들어간다
+        steps = distro_mod.get("k3s").install_steps("h")
+        assert "config.yaml" in steps[0].command
+        assert "get.k3s.io" in steps[1].command
 
     def test_rke2_installs_then_starts(self):
         # RKE2 는 설치와 기동이 분리돼 있다
         steps = distro_mod.get("rke2").install_steps("h")
         assert len(steps) > 1
         assert any("systemctl" in step.command for step in steps)
+
+    @pytest.mark.parametrize("name", ["k3s", "rke2"])
+    def test_tls_san_lives_in_config_file_not_flags(self, name):
+        """플래그에 박으면 주소가 바뀌었을 때 고칠 방법이 없다."""
+        steps = distro_mod.get(name).install_steps("10.0.0.1")
+        config_steps = [s for s in steps if "config.yaml" in s.command]
+        assert len(config_steps) == 1
+        assert "10.0.0.1" in config_steps[0].command
+        # 설치 명령 자체에는 주소가 없어야 한다
+        install = [s for s in steps if "curl" in s.command]
+        assert all("10.0.0.1" not in s.command for s in install)
 
     @pytest.mark.parametrize("name", ["k3s", "rke2"])
     def test_every_step_has_a_label(self, name):
@@ -170,6 +184,71 @@ class TestMemoryPreflight:
         assert (
             distro_mod.get("rke2").min_memory_mb > distro_mod.get("k3s").min_memory_mb
         )
+
+
+class TestCertificateCoverage:
+    """IP 가 바뀐 뒤 재실행하면 kubeconfig 만 갱신되고 인증서는 옛 주소로
+    남는다. 그 상태를 감지하지 못하면 '성공했는데 kubectl 이 전부 거부되는'
+    kubeconfig 를 내주게 된다."""
+
+    # 실서버(gcp-lab)의 openssl 출력 그대로
+    OPENSSL_OUT = (
+        "X509v3 Subject Alternative Name: \n"
+        "    DNS:kubernetes, DNS:kubernetes.default, "
+        "DNS:kubernetes.default.svc, DNS:kubernetes.default.svc.cluster.local, "
+        "DNS:localhost, DNS:ssherpa-lab.asia-northeast3-c.c.ssherpa.internal, "
+        "IP Address:34.50.34.61, IP Address:127.0.0.1, "
+        "IP Address:10.178.0.2, IP Address:10.43.0.1\n"
+    )
+
+    def test_parses_both_dns_and_ip_entries(self):
+        sans = cluster.parse_san_list(self.OPENSSL_OUT)
+        assert "34.50.34.61" in sans
+        assert "localhost" in sans
+        assert "kubernetes.default.svc.cluster.local" in sans
+
+    def test_exact_match_only(self):
+        # '4.50.34.6' 같은 부분 문자열이 통과하면 안 된다
+        sans = cluster.parse_san_list(self.OPENSSL_OUT)
+        assert "4.50.34.6" not in sans
+        assert "34.50.34.615" not in sans
+
+    def _with_output(self, monkeypatch, rc, stdout):
+        from ssherpa.ssh import CommandResult
+
+        def _run(*_args, **_kwargs):
+            return CommandResult(rc, stdout, "")
+
+        monkeypatch.setattr(cluster, "run", _run)
+
+    def test_covered_address(self, monkeypatch):
+        self._with_output(monkeypatch, 0, self.OPENSSL_OUT)
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+        assert cluster.certificate_covers(node, distro_mod.get("k3s"), "34.50.34.61") is True
+
+    def test_changed_address_is_detected(self, monkeypatch):
+        self._with_output(monkeypatch, 0, self.OPENSSL_OUT)
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+        assert cluster.certificate_covers(node, distro_mod.get("k3s"), "35.1.2.3") is False
+
+    def test_hostname_target_works(self, monkeypatch):
+        self._with_output(monkeypatch, 0, self.OPENSSL_OUT)
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+        assert cluster.certificate_covers(node, distro_mod.get("k3s"), "localhost") is True
+
+    def test_unreadable_cert_is_indeterminate(self, monkeypatch):
+        # openssl 이 없거나 파일이 없으면 판단 불가 — 막지 않는다
+        self._with_output(monkeypatch, 1, "")
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+        assert cluster.certificate_covers(node, distro_mod.get("k3s"), "x") is None
+
+    @pytest.mark.parametrize("name", ["k3s", "rke2"])
+    def test_refresh_rewrites_config_and_restarts(self, name):
+        chosen = distro_mod.get(name)
+        step = chosen.refresh_certificate_step("35.1.2.3")
+        assert "35.1.2.3" in step.command
+        assert chosen.config_path in step.command
+        assert f"systemctl restart {chosen.service}" in step.command
 
 
 class TestRewriteKubeconfig:

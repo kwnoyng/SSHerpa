@@ -520,6 +520,14 @@ def up(
         console.print(
             Padding(f"[dim]{chosen.name} was already installed — left as is.[/dim]", (0, 0, 0, 2))
         )
+    if result.certificate_refreshed:
+        console.print(
+            Padding(
+                "[yellow]The host address changed since install — the certificate "
+                "was refreshed to match.[/yellow]",
+                (0, 0, 0, 2),
+            )
+        )
     console.print(Padding("[bold green]Cluster ready[/bold green]", (0, 0, 0, 2)))
     console.print(Padding(f"[dim]kubeconfig: {result.kubeconfig}[/dim]", (0, 0, 0, 2)))
     console.print()

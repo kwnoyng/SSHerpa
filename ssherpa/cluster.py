@@ -143,6 +143,37 @@ def wait_for_ready(node: Node, distro: Distro) -> None:
     )
 
 
+def parse_san_list(text: str) -> list[str]:
+    """openssl 의 subjectAltName 출력에서 주소만 뽑는다.
+
+    입력 형태:
+        X509v3 Subject Alternative Name:
+            DNS:kubernetes, DNS:localhost, IP Address:34.50.34.61, ...
+    """
+    values: list[str] = []
+    for line in text.splitlines():
+        for entry in line.split(","):
+            entry = entry.strip()
+            for prefix in ("DNS:", "IP Address:", "IP:"):
+                if entry.startswith(prefix):
+                    values.append(entry[len(prefix):].strip())
+                    break
+    return values
+
+
+def certificate_covers(node: Node, distro: Distro, address: str) -> Optional[bool]:
+    """serving 인증서가 이 주소를 포함하는지. 확인할 수 없으면 None.
+
+    kubectl 은 접속한 주소가 인증서 SAN 에 없으면 거부한다. 클라우드에서
+    중지/재시작으로 IP 가 바뀌면 인증서는 옛 주소로 남으므로, 여기서
+    걸러내지 않으면 '성공했는데 못 쓰는' kubeconfig 를 내주게 된다.
+    """
+    result = run(node.target, distro.read_san_command(), timeout=60)
+    if result.rc != 0 or "DNS:" not in result.stdout:
+        return None  # openssl 이 없거나 인증서를 못 읽음 — 판단 불가
+    return address in parse_san_list(result.stdout)
+
+
 def kubeconfig_dir() -> Path:
     return Path.home() / ".ssherpa" / "kubeconfig"
 
@@ -195,6 +226,7 @@ class UpResult:
     api_address: str
     api_reachable: bool
     already_installed: bool
+    certificate_refreshed: bool = False
 
 
 def up(node: Node, distro: Distro, reporter=None) -> UpResult:
@@ -215,6 +247,31 @@ def up(node: Node, distro: Distro, reporter=None) -> UpResult:
     with reporter.step("wait for node"):
         wait_for_ready(node, distro)
 
+    # 인증서가 지금 접속 주소를 포함하는지 확인한다. 클라우드에서 중지/재시작
+    # 으로 IP 가 바뀐 뒤 재실행하면, kubeconfig 만 갱신되고 인증서는 옛 주소로
+    # 남아 kubectl 이 전부 거부된다. 설정을 다시 쓰고 재시작하면 재발급된다.
+    refreshed = False
+    with reporter.step("verify certificate"):
+        covered = certificate_covers(node, distro, api_address)
+
+    if covered is False:
+        with reporter.step("refresh certificate"):
+            _run_step(node, distro.refresh_certificate_step(api_address))
+            refreshed = True
+        with reporter.step("wait for node"):
+            wait_for_ready(node, distro)
+        with reporter.step("verify certificate"):
+            if certificate_covers(node, distro, api_address) is False:
+                raise ClusterError(
+                    f"the certificate still does not cover {api_address}",
+                    [
+                        "The refresh did not take. Reinstalling will issue a "
+                        "fresh certificate:",
+                        f"    ssherpa down {node.target.name or ''}".rstrip(),
+                        f"    ssherpa up {node.target.name or ''}".rstrip(),
+                    ],
+                )
+
     with reporter.step("fetch kubeconfig"):
         path = fetch_kubeconfig(node, distro, api_address)
 
@@ -226,6 +283,7 @@ def up(node: Node, distro: Distro, reporter=None) -> UpResult:
         api_address=api_address,
         api_reachable=reachable,
         already_installed=already,
+        certificate_refreshed=refreshed,
     )
 
 
