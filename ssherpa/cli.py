@@ -80,6 +80,14 @@ def _print_checks(rows: list[tuple[str, bool, str]]) -> None:
     console.print(Padding(table, (0, 0, 0, 2)))
 
 
+def _say(text: str = "", indent: int = 2) -> None:
+    """들여쓰기 붙여 한 줄 출력. 인자 없이 부르면 빈 줄."""
+    if text:
+        console.print(Padding(text, (0, 0, 0, indent)))
+    else:
+        console.print()
+
+
 def _fail(message: str, hints: Optional[list[str]] = None) -> None:
     """실패 사유와 해결 방법을 출력하고 종료 코드 1 로 끝낸다."""
     err_console.print()
@@ -90,6 +98,21 @@ def _fail(message: str, hints: Optional[list[str]] = None) -> None:
             err_console.print(Padding(hint, (0, 0, 0, 4)))
     err_console.print()
     raise typer.Exit(code=1)
+
+
+@contextlib.contextmanager
+def _surface_errors():
+    """도메인 오류를 사람 말로 출력하고 종료 코드 1 로 끝낸다.
+
+    SSHError/ClusterError 는 (message, hints) 쌍을, InventoryError 는
+    문자열 하나를 갖는다 — 어느 쪽이든 _fail 로 모은다.
+    """
+    try:
+        yield
+    except (SSHError, ClusterError) as exc:
+        _fail(exc.message, exc.hints)
+    except InventoryError as exc:
+        _fail(str(exc))
 
 
 class StepReporter:
@@ -139,10 +162,8 @@ def target_add(
     ),
 ) -> None:
     """Register a target in the inventory. Does not connect."""
-    try:
+    with _surface_errors():
         target = add_target(name, host=host, user=user, port=port, key=key)
-    except InventoryError as exc:
-        _fail(str(exc))
 
     console.print()
     console.print(
@@ -160,10 +181,8 @@ def target_add(
 @target_app.command("list")
 def target_list() -> None:
     """List registered targets. Does not connect."""
-    try:
+    with _surface_errors():
         targets = list_targets()
-    except InventoryError as exc:
-        _fail(str(exc))
 
     if not targets:
         console.print()
@@ -203,10 +222,8 @@ def target_remove(
     name: str = typer.Argument(..., help="Target name to remove"),
 ) -> None:
     """Remove a target from the inventory. Does not touch the remote host."""
-    try:
+    with _surface_errors():
         remove_target(name)
-    except InventoryError as exc:
-        _fail(str(exc))
 
     console.print()
     console.print(Padding(f"[green]✓[/green] [bold]{name}[/bold] removed", (0, 0, 0, 2)))
@@ -240,10 +257,8 @@ def check(
     if name:
         if host or user:
             _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
-        try:
+        with _surface_errors():
             target = get_target(name)
-        except InventoryError as exc:
-            _fail(str(exc))
     else:
         if not host:
             _fail("A target name or --host is required.", USAGE_HINTS)
@@ -367,10 +382,8 @@ def _confirm(question: str, *, assume_yes: bool) -> bool:
 
 def _installed_on(node) -> list[str]:
     """호스트에 설치된 배포판 이름 목록."""
-    try:
+    with _surface_errors():
         host = cluster.status(node, list(distro_mod.DISTROS.values()))
-    except SSHError as exc:
-        _fail(exc.message, exc.hints)
     return [d.name for d in host.installed]
 
 
@@ -430,10 +443,74 @@ def _distro_to_install(
 
 
 def _load_target(name: str) -> Target:
-    try:
+    with _surface_errors():
         return get_target(name)
-    except InventoryError as exc:
-        _fail(str(exc))
+
+
+def _print_up_result(result, distro_name: str, target: Target) -> None:
+    """up 의 결과 요약과 다음 할 일 안내.
+
+    ~/.kube/config 병합 결과에 따라 kubectl 사용법이 셋으로 갈린다:
+    기본값이 됐으면 그냥 kubectl, 기존 기본값을 존중했으면 --context,
+    병합이 실패했으면 단독 파일 + 환경변수 폴백.
+    """
+    _say()
+    if result.already_installed:
+        _say(f"[dim]{distro_name} was already installed — left as is.[/dim]")
+    if result.certificate_refreshed:
+        _say(
+            "[yellow]The host address changed since install — the certificate "
+            "was refreshed to match.[/yellow]"
+        )
+    _say("[bold green]Cluster ready[/bold green]")
+    _say(f"[dim]kubeconfig: {result.kubeconfig}[/dim]")
+    _say()
+
+    if result.merge_error:
+        _say(f"[yellow]Could not update ~/.kube/config: {result.merge_error}[/yellow]")
+        _say("Use the standalone file instead:", indent=4)
+        kubectl = f'$env:KUBECONFIG="{result.kubeconfig}"; kubectl'
+    elif result.context_is_current:
+        _say(
+            f"[dim]Added to ~/.kube/config as context "
+            f"[/dim][bold]{result.context}[/bold][dim] (now the default).[/dim]"
+        )
+        kubectl = "kubectl"
+    else:
+        _say(
+            f"[dim]Added to ~/.kube/config as context "
+            f"[/dim][bold]{result.context}[/bold][dim] — your current context "
+            "was left untouched.[/dim]"
+        )
+        kubectl = f"kubectl --context {result.context}"
+
+    _say()
+    if result.api_reachable:
+        _say("Use it from any terminal:")
+        _say(f"[dim]{kubectl} get nodes[/dim]", indent=4)
+    else:
+        # 포트가 막힌 것은 흔한 정상 상황이다. 실패로 처리하지 않고 방법을 안내한다.
+        _say(f"[yellow]Port {cluster.API_PORT} is not reachable from here.[/yellow]")
+        _say()
+        _say("Open an SSH tunnel in another terminal:", indent=4)
+        _say(
+            f"[dim]ssh -L {cluster.API_PORT}:127.0.0.1:{cluster.API_PORT} "
+            f"{target.destination()}[/dim]",
+            indent=6,
+        )
+        _say()
+        _say("then point kubectl at the tunnel:", indent=4)
+        _say(
+            f"[dim]{kubectl} --server https://127.0.0.1:{cluster.API_PORT} get nodes[/dim]",
+            indent=6,
+        )
+        _say()
+        _say(
+            "[dim]Opening the port to the internet instead would expose the "
+            "cluster API — restrict it to your own address if you do.[/dim]",
+            indent=4,
+        )
+    _say()
 
 
 @app.command("up")
@@ -488,99 +565,10 @@ def up(
     )
     console.print()
 
-    try:
+    with _surface_errors():
         result = cluster.up(node, chosen, StepReporter(console))
-    except SSHError as exc:
-        _fail(exc.message, exc.hints)
-    except ClusterError as exc:
-        _fail(exc.message, exc.hints)
 
-    console.print()
-    if result.already_installed:
-        console.print(
-            Padding(f"[dim]{chosen.name} was already installed — left as is.[/dim]", (0, 0, 0, 2))
-        )
-    if result.certificate_refreshed:
-        console.print(
-            Padding(
-                "[yellow]The host address changed since install — the certificate "
-                "was refreshed to match.[/yellow]",
-                (0, 0, 0, 2),
-            )
-        )
-    console.print(Padding("[bold green]Cluster ready[/bold green]", (0, 0, 0, 2)))
-    console.print(Padding(f"[dim]kubeconfig: {result.kubeconfig}[/dim]", (0, 0, 0, 2)))
-    console.print()
-
-    # ~/.kube/config 병합 결과에 따라 kubectl 사용법이 달라진다.
-    if result.merge_error:
-        console.print(
-            Padding(
-                f"[yellow]Could not update ~/.kube/config: {result.merge_error}[/yellow]",
-                (0, 0, 0, 2),
-            )
-        )
-        console.print(Padding("Use the standalone file instead:", (0, 0, 0, 4)))
-        kubectl_cmd = f'$env:KUBECONFIG="{result.kubeconfig}"; kubectl'
-    elif result.context_is_current:
-        console.print(
-            Padding(
-                f"[dim]Added to ~/.kube/config as context "
-                f"[/dim][bold]{result.context}[/bold][dim] (now the default).[/dim]",
-                (0, 0, 0, 2),
-            )
-        )
-        kubectl_cmd = "kubectl"
-    else:
-        console.print(
-            Padding(
-                f"[dim]Added to ~/.kube/config as context "
-                f"[/dim][bold]{result.context}[/bold][dim] — your current context "
-                "was left untouched.[/dim]",
-                (0, 0, 0, 2),
-            )
-        )
-        kubectl_cmd = f"kubectl --context {result.context}"
-
-    console.print()
-    if result.api_reachable:
-        console.print(Padding("Use it from any terminal:", (0, 0, 0, 2)))
-        console.print(Padding(f"[dim]{kubectl_cmd} get nodes[/dim]", (0, 0, 0, 4)))
-    else:
-        # 포트가 막힌 것은 흔한 정상 상황이다. 실패로 처리하지 않고 방법을 안내한다.
-        console.print(
-            Padding(
-                f"[yellow]Port {cluster.API_PORT} is not reachable from here.[/yellow]",
-                (0, 0, 0, 2),
-            )
-        )
-        console.print()
-        console.print(Padding("Open an SSH tunnel in another terminal:", (0, 0, 0, 4)))
-        console.print(
-            Padding(
-                f"[dim]ssh -L {cluster.API_PORT}:127.0.0.1:{cluster.API_PORT} "
-                f"{target.destination()}[/dim]",
-                (0, 0, 0, 6),
-            )
-        )
-        console.print()
-        console.print(Padding("then point kubectl at the tunnel:", (0, 0, 0, 4)))
-        console.print(
-            Padding(
-                f"[dim]{kubectl_cmd} --server https://127.0.0.1:{cluster.API_PORT} "
-                "get nodes[/dim]",
-                (0, 0, 0, 6),
-            )
-        )
-        console.print()
-        console.print(
-            Padding(
-                "[dim]Opening the port to the internet instead would expose the "
-                "cluster API — restrict it to your own address if you do.[/dim]",
-                (0, 0, 0, 4),
-            )
-        )
-    console.print()
+    _print_up_result(result, chosen.name, target)
 
 
 @app.command("status")
@@ -592,10 +580,8 @@ def status(
     node = cluster.nodes_for_host_mode(target)[0]
     known = list(distro_mod.DISTROS.values())
 
-    try:
+    with _surface_errors():
         host = cluster.status(node, known)
-    except SSHError as exc:
-        _fail(exc.message, exc.hints)
 
     table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
     table.add_column(no_wrap=True, style="bold")
@@ -685,12 +671,8 @@ def down(
 
     for distro_name in installed:
         chosen = _resolve_distro(distro_name)
-        try:
+        with _surface_errors():
             cluster.down(node, chosen, StepReporter(console))
-        except SSHError as exc:
-            _fail(exc.message, exc.hints)
-        except ClusterError as exc:
-            _fail(exc.message, exc.hints)
 
     console.print()
     console.print(Padding("[bold green]Removed[/bold green]", (0, 0, 0, 2)))
