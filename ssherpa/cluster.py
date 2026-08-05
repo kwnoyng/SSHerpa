@@ -234,10 +234,20 @@ class UpResult:
     merge_error: Optional[str] = None  # 병합 실패 사유 (클러스터 자체는 정상)
 
 
-def up(node: Node, distro: Distro, reporter=None) -> UpResult:
-    """노드 하나에 쿠버네티스를 설치하고 kubeconfig 를 가져온다."""
+def up(
+    node: Node,
+    distro: Distro,
+    reporter=None,
+    api_address: Optional[str] = None,
+) -> UpResult:
+    """노드 하나에 쿠버네티스를 설치하고 kubeconfig 를 가져온다.
+
+    api_address 는 '내 PC 의 kubectl 이 접속할 주소'다. host 모드에서는
+    노드 주소 그대로지만, vm 모드에서는 노드(VM)의 주소가 NAT 안이라
+    밖에서 닿는 주소(호스트)를 따로 받아 인증서와 kubeconfig 에 넣는다.
+    """
     reporter = reporter or NullReporter()
-    api_address = node.target.host
+    api_address = api_address or node.target.host
 
     with reporter.step("preflight"):
         already = is_installed(node, distro)

@@ -174,6 +174,49 @@ class TestBuildCommand:
         assert "-p" in argv and "2222" in argv
 
 
+class TestProxyJump:
+    """NAT 뒤의 VM 은 호스트를 경유해서만 닿는다 (-J)."""
+
+    VM = Target(
+        name="gcp-lab/ssherpa-node-1",
+        host="192.168.122.160",
+        user="ssherpa",
+        key="~/.ssherpa/vm_ed25519",
+        jump="ssherpa@34.22.85.249",
+    )
+
+    def test_jump_flag_is_passed(self):
+        argv = ssh._build_command(self.VM, "true")
+        assert "-J" in argv
+        assert argv[argv.index("-J") + 1] == "ssherpa@34.22.85.249"
+
+    def test_no_jump_flag_without_jump(self):
+        # -J 를 억지로 넘기면 ~/.ssh/config 의 ProxyJump 를 덮어쓴다
+        assert "-J" not in ssh._build_command(TARGET, "true")
+
+    def test_jump_spec_includes_port_only_when_given(self):
+        assert Target(name=None, host="h", user="u").jump_spec() == "u@h"
+        assert Target(name=None, host="h", user="u", port=2222).jump_spec() == "u@h:2222"
+        assert Target(name=None, host="h").jump_spec() == "h"  # config 존중
+
+    def test_beyond_jump_failure_names_the_right_segment(self):
+        # 경유지 너머의 실패에 '타겟의 sshd 를 확인하라'고 하면 사용자는
+        # 멀쩡한 경유지를 뒤진다 — 실제 확인할 곳은 경유지→목적지 구간이다.
+        stderr = (
+            "channel 0: open failed: connect failed: Connection refused\n"
+            "stdio forwarding failed"
+        )
+        err = ssh._classify(stderr, self.VM)
+        assert "jump host could not reach 192.168.122.160" in err.message
+        assert any("still be booting" in hint for hint in err.hints)
+
+    def test_plain_refused_is_not_misread_as_jump_failure(self):
+        err = ssh._classify(
+            "ssh: connect to host x port 22: Connection refused", TARGET
+        )
+        assert "connection refused" in err.message
+
+
 class TestSshConfigRespect:
     """명령줄 옵션은 ~/.ssh/config 를 이긴다. 그래서 사용자가 지정하지 않은
     값을 우리가 기본값으로 채워 넘기면, config 의 Port 2222 를 -p 22 로

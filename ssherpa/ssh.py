@@ -32,6 +32,10 @@ class Target:
     ~/.ssh/config 의 User/Port/IdentityFile/ProxyJump 를 존중한다.
     우리가 기본값 22 를 강제로 넘기면 config 의 Port 2222 를 덮어써서
     'ssh 로는 되는데 SSHerpa 로는 안 되는' 미스터리를 만든다.
+
+    jump 는 경유지다(-J). NAT 뒤의 VM 처럼 내 PC 가 직접 닿을 수 없는
+    주소는 그 주소를 아는 호스트를 통과해서 들어간다. 인증은 전부 이쪽
+    (내 PC)에서 이뤄지므로 개인키가 경유지에 복사되지 않는다.
     """
 
     name: Optional[str]
@@ -39,6 +43,7 @@ class Target:
     user: Optional[str] = None
     port: Optional[int] = None
     key: Optional[str] = None
+    jump: Optional[str] = None  # -J 에 넘길 경유지 (user@host[:port])
 
     def destination(self) -> str:
         """ssh 에 넘길 목적지. user 미지정이면 host 만 (config 가 정함)."""
@@ -48,6 +53,10 @@ class Target:
         """표시용 주소."""
         end = self.destination()
         return f"{end}:{self.port}" if self.port else end
+
+    def jump_spec(self) -> str:
+        """이 타겟을 경유지로 쓸 때 -J 에 들어갈 표기."""
+        return f"{self.destination()}:{self.port}" if self.port else self.destination()
 
 
 @dataclass
@@ -77,7 +86,11 @@ def _build_command(target: Target, remote_command: str) -> list[str]:
     if target.port:
         argv += ["-p", str(target.port)]
     if target.key:
+        # -i 는 기본 키 탐색을 대체하지 않고 앞에 추가된다. 그래서 경유지
+        # 인증은 계속 기본 키/agent 로 이뤄진다 (실측: -J + VM 전용 -i 조합).
         argv += ["-i", os.path.expanduser(target.key)]
+    if target.jump:
+        argv += ["-J", target.jump]
     argv += [target.destination(), remote_command]
     return argv
 
@@ -195,6 +208,21 @@ def _classify(stderr: str, target: Target) -> SSHError:
             [
                 f"Is {ep} powered on with the port open?",
                 "Is a firewall (firewalld / ufw) blocking it?",
+            ],
+        )
+
+    # 경유 실패는 'connection refused' 보다 먼저 본다. 경유지 너머의 실패도
+    # stderr 에 "connect failed: Connection refused" 를 담기 때문에, 순서가
+    # 바뀌면 '타겟의 sshd 를 확인하라'는 엉뚱한 처방이 나간다 — 실제로
+    # 확인할 곳은 경유지에서 최종 목적지로 가는 구간이다.
+    if target.jump and "open failed" in lower:
+        return SSHError(
+            f"the jump host could not reach {target.host}",
+            [
+                f"The jump host ({target.jump}) answered, but from there the",
+                f"destination ({target.host}) was unreachable.",
+                "If the destination is a VM, it may still be booting — try again",
+                "in a few seconds.",
             ],
         )
 

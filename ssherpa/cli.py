@@ -14,9 +14,11 @@ from rich.console import Console
 from rich.padding import Padding
 from rich.table import Table
 
-from . import __version__, cluster, facts, probe, support
+from . import __version__, cluster, facts, probe, support, virt
 from . import distro as distro_mod
 from . import doctor as doctor_mod
+from . import kubeconfig as kubeconf
+from . import vm as vm_mod
 from .cluster import ClusterError
 from .inventory import (
     InventoryError,
@@ -27,6 +29,8 @@ from .inventory import (
     remove_target,
 )
 from .ssh import SSHError, Target, run
+from .virt import VirtError
+from .vm import VmError
 
 
 def _force_utf8_output() -> None:
@@ -110,7 +114,7 @@ def _surface_errors():
     """
     try:
         yield
-    except (SSHError, ClusterError) as exc:
+    except (SSHError, ClusterError, VirtError, VmError) as exc:
         _fail(exc.message, exc.hints)
     except InventoryError as exc:
         _fail(str(exc))
@@ -291,6 +295,11 @@ def doctor(
     if diagnosis.capable:
         _say(f"[bold green]{label} can run VM-backed clusters[/bold green]")
         _say()
+        # 판정만 하고 다음 걸음을 안 알려주면 발견 경로가 끊긴다 —
+        # target add 가 check 를 안내하는 것과 같은 원칙.
+        if target.name:
+            _say(f"[dim]Next:  ssherpa up {target.name} --vm[/dim]")
+            _say()
         return
 
     # 처방 속 자리표시자를 실제 타겟 이름으로 채운다
@@ -581,6 +590,62 @@ def _print_up_result(result, distro_name: str, target: Target) -> None:
     _say()
 
 
+def _up_vm(name: str, target: Target, requested: Optional[str]) -> None:
+    """vm 모드: 호스트 위에 VM 을 만들고 그 안에 쿠버네티스를 올린다.
+
+    사용자는 libvirt/cloud-init/포트포워딩의 존재를 몰라도 된다 —
+    기반 준비부터 kubectl 연결까지가 이 한 번의 호출이다.
+    """
+    # 호스트에 직접 설치된 클러스터와는 공존할 수 없다. kubectl 이 쓸 6443 을
+    # 호스트 모드는 자신이 듣고, vm 모드는 VM 으로 넘겨야 하기 때문이다.
+    node_host = cluster.nodes_for_host_mode(target)[0]
+    installed = _installed_on(node_host)
+    if installed:
+        _fail(
+            f"{installed[0]} is installed directly on this host",
+            [
+                "A host-mode cluster and a VM cluster would fight over "
+                f"port {cluster.API_PORT}.",
+                "Remove the existing one first:",
+                f"    ssherpa down {name}",
+            ],
+        )
+
+    # VM 사양이 2 GB 로 고정돼 있어 지금은 k3s 만 들어간다.
+    if requested and requested != "k3s":
+        _fail(
+            "VM mode currently installs k3s only",
+            [
+                f"The VM has 2 GB of memory and {requested} needs more.",
+                "Omit --distro (or pass --distro k3s).",
+            ],
+        )
+    chosen = _resolve_distro("k3s")
+
+    console.print()
+    console.print(
+        Padding(
+            f"Installing [bold]{chosen.name}[/bold] on a VM on [bold]{name}[/bold]",
+            (0, 0, 0, 2),
+        )
+    )
+    console.print()
+
+    reporter = StepReporter(console)
+    with _surface_errors():
+        virt.setup(target, reporter)
+        info = vm_mod.create(target, reporter=reporter)
+        vm_mod.expose_api(target, info.ip, reporter)
+        vm_node = cluster.Node(
+            name=f"{name}-vm", target=vm_mod.vm_target(target, info)
+        )
+        # 인증서와 kubeconfig 에는 밖에서 닿는 주소(호스트)를 넣는다 —
+        # VM 의 NAT 주소는 내 PC 의 kubectl 이 갈 수 없는 주소다.
+        result = cluster.up(vm_node, chosen, reporter, api_address=target.host)
+
+    _print_up_result(result, chosen.name, target)
+
+
 @app.command("up")
 def up(
     name: str = typer.Argument(..., help="Registered target name"),
@@ -588,6 +653,9 @@ def up(
         None,
         "--distro",
         help=f"Choose without prompting ({distro_mod.names()}) — for scripts",
+    ),
+    vm_mode: bool = typer.Option(
+        False, "--vm", help="Run the cluster inside a VM on the host"
     ),
     assume_yes: bool = typer.Option(
         False, "--yes", "-y", help="Do not ask for confirmation"
@@ -597,10 +665,32 @@ def up(
 
     Asks which distribution to install when the host is empty (pass --distro
     to skip the question, e.g. in scripts). If one is already installed it is
-    detected and left alone, so re-running is safe.
+    detected and left alone, so re-running is safe. With --vm the cluster
+    runs inside a VM on the host instead of on the host itself.
     """
     target = _load_target(name)
+
+    if vm_mode:
+        _up_vm(name, target, distro)
+        return
+
     node = cluster.nodes_for_host_mode(target)[0]
+
+    # 반대 방향의 6443 충돌도 막는다: VM 클러스터가 이미 있으면 호스트 모드
+    # 설치는 포워딩 규칙과 포트를 두고 싸우게 된다.
+    with _surface_errors():
+        existing_vms = vm_mod.list_vms(target)
+    if existing_vms:
+        _fail(
+            f"A VM cluster already runs on this host ({', '.join(existing_vms)})",
+            [
+                f"It forwards port {cluster.API_PORT} to the VM, which a "
+                "host-mode cluster would also need.",
+                "Remove it first:",
+                f"    ssherpa down {name}",
+            ],
+        )
+
     already_installed = _installed_on(node)
 
     # 충돌(--distro 가 설치본과 다름)은 재실행 안내보다 먼저 판정해야 한다 —
@@ -650,6 +740,7 @@ def status(
 
     with _surface_errors():
         host = cluster.status(node, known)
+        vms = vm_mod.list_vms(target)
 
     table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
     table.add_column(no_wrap=True, style="bold")
@@ -668,6 +759,17 @@ def status(
     console.print()
     console.print(Padding(table, (0, 0, 0, 2)))
     console.print()
+
+    for vm_name in vms:
+        state = vm_mod.vm_state(target, vm_name)
+        colour = "green" if state == "running" else "yellow"
+        console.print(
+            Padding(
+                f"[dim]vm:[/dim]  {vm_name}  [{colour}]{state or 'unknown'}[/{colour}]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
 
     if host.node_line:
         console.print(Padding(f"[dim]node:[/dim]  {host.node_line}", (0, 0, 0, 2)))
@@ -694,7 +796,7 @@ def status(
                 Padding(f"[dim]ssherpa down {name} --distro {other}[/dim]", (0, 0, 0, 8))
             )
         err_console.print()
-    elif not host.installed:
+    elif not host.installed and not vms:
         console.print(Padding(f"[dim]Nothing installed.  ssherpa up {name}[/dim]", (0, 0, 0, 2)))
         console.print()
 
@@ -708,24 +810,27 @@ def down(
 ) -> None:
     """Remove Kubernetes from a target host.
 
-    Whatever is installed is detected and removed — there is nothing to choose,
-    since a host can only run one distribution.
+    Whatever is there is detected and removed — a host-mode install, a VM
+    cluster, or nothing. There is no mode to remember or pass.
     """
     target = _load_target(name)
     node = cluster.nodes_for_host_mode(target)[0]
     installed = _installed_on(node)
+    with _surface_errors():
+        vms = vm_mod.list_vms(target)
 
-    if not installed:
+    if not installed and not vms:
         console.print()
         console.print(Padding("[dim]Nothing is installed on this host.[/dim]", (0, 0, 0, 2)))
         console.print()
         return
 
     # 클러스터를 통째로 없애는 동작이라 되돌릴 수 없다.
+    removing = installed + vms
     console.print()
     console.print(
         Padding(
-            f"This removes [bold]{', '.join(installed)}[/bold] from [bold]{name}[/bold] "
+            f"This removes [bold]{', '.join(removing)}[/bold] from [bold]{name}[/bold] "
             "and destroys the cluster.",
             (0, 0, 0, 2),
         )
@@ -736,11 +841,27 @@ def down(
         raise typer.Exit(code=1)
 
     console.print()
+    reporter = StepReporter(console)
+
+    # VM 클러스터는 VM 삭제가 곧 제거다 — 안에서 k3s 를 지울 필요가 없다.
+    if vms:
+        with _surface_errors():
+            for vm_name in vms:
+                vm_mod.destroy(target, vm_name, reporter)
+            vm_mod.unexpose_api(target, reporter)
+
+        # 죽은 클러스터를 가리키는 로컬 흔적도 함께 걷는다 (host 모드와 동일)
+        entry = f"{name}-vm"
+        path = cluster.kubeconfig_path(entry)
+        if path.exists():
+            path.unlink()
+        with contextlib.suppress(kubeconf.KubeconfigError):
+            kubeconf.remove(entry)
 
     for distro_name in installed:
         chosen = _resolve_distro(distro_name)
         with _surface_errors():
-            cluster.down(node, chosen, StepReporter(console))
+            cluster.down(node, chosen, reporter)
 
     console.print()
     console.print(Padding("[bold green]Removed[/bold green]", (0, 0, 0, 2)))
@@ -754,12 +875,27 @@ def down(
 def ssh_cmd(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Registered target name"),
+    vm_flag: bool = typer.Option(
+        False, "--vm", help="Connect to the VM on the host instead of the host"
+    ),
 ) -> None:
     """Open an interactive SSH session to a target.
 
-    Extra arguments are passed straight through to ssh.
+    With --vm the session lands inside the SSHerpa VM on the host — the
+    VM's address, dedicated key, and the hop through the host are filled
+    in automatically. Extra arguments are passed straight through to ssh.
     """
     target = _load_target(name)
+
+    if vm_flag:
+        with _surface_errors():
+            info = vm_mod.find(target)
+        if info is None:
+            _fail(
+                "There is no SSHerpa VM on this host",
+                [f"Create one (with a cluster inside):  ssherpa up {name} --vm"],
+            )
+        target = vm_mod.vm_target(target, info)
 
     if shutil.which("ssh") is None:
         _fail("ssh client not found")
@@ -770,6 +906,8 @@ def ssh_cmd(
         argv += ["-p", str(target.port)]
     if target.key:
         argv += ["-i", os.path.expanduser(target.key)]
+    if target.jump:
+        argv += ["-J", target.jump]
     argv += [target.destination(), *ctx.args]
 
     # 대화형 세션이므로 출력을 가로채지 않고 그대로 넘긴다.

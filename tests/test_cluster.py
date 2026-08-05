@@ -324,6 +324,39 @@ class TestUpHealOrchestration:
         with pytest.raises(cluster.ClusterError, match="still does not cover"):
             cluster.up(node, distro_mod.get("k3s"))
 
+    def test_api_address_override_reaches_cert_and_kubeconfig(
+        self, monkeypatch, tmp_path
+    ):
+        # vm 모드: 노드 주소(NAT 안의 VM)와 kubectl 이 접속할 주소(호스트)가
+        # 다르다. 오버라이드가 인증서 검사와 kubeconfig 양쪽에 스며야 한다 —
+        # 한쪽만 바뀌면 '접속은 되는데 인증서가 거부'가 된다.
+        self._wire(monkeypatch, tmp_path, coverage_answers=[True])
+        seen = {}
+        fake_kc = tmp_path / "kc2.yaml"
+        fake_kc.write_text("apiVersion: v1\n")
+
+        def record_cert(_node, _distro, address):
+            seen["certificate"] = address
+            return True
+
+        def record_fetch(_node, _distro, address):
+            seen["kubeconfig"] = address
+            return fake_kc
+
+        monkeypatch.setattr(cluster, "certificate_covers", record_cert)
+        monkeypatch.setattr(cluster, "fetch_kubeconfig", record_fetch)
+
+        vm_node = cluster.Node(
+            name="gcp-lab-vm",
+            target=Target(name=None, host="192.168.122.160", user="ssherpa"),
+        )
+        cluster.up(vm_node, distro_mod.get("k3s"), api_address="34.22.85.249")
+
+        assert seen == {
+            "certificate": "34.22.85.249",
+            "kubeconfig": "34.22.85.249",
+        }
+
 
 class TestRewriteKubeconfig:
     """127.0.0.1 그대로 두면 내 PC 에서 kubectl 이 자기 자신에게 접속한다."""
