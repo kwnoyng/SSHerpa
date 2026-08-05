@@ -453,12 +453,40 @@ def up(
     console.print(Padding(f"[dim]kubeconfig: {result.kubeconfig}[/dim]", (0, 0, 0, 2)))
     console.print()
 
-    if result.api_reachable:
-        console.print(Padding("Use it with:", (0, 0, 0, 2)))
+    # ~/.kube/config 병합 결과에 따라 kubectl 사용법이 달라진다.
+    if result.merge_error:
         console.print(
-            Padding(f"[dim]$env:KUBECONFIG=\"{result.kubeconfig}\"; kubectl get nodes[/dim]",
-                    (0, 0, 0, 4))
+            Padding(
+                f"[yellow]Could not update ~/.kube/config: {result.merge_error}[/yellow]",
+                (0, 0, 0, 2),
+            )
         )
+        console.print(Padding("Use the standalone file instead:", (0, 0, 0, 4)))
+        kubectl_cmd = f'$env:KUBECONFIG="{result.kubeconfig}"; kubectl'
+    elif result.context_is_current:
+        console.print(
+            Padding(
+                f"[dim]Added to ~/.kube/config as context "
+                f"[/dim][bold]{result.context}[/bold][dim] (now the default).[/dim]",
+                (0, 0, 0, 2),
+            )
+        )
+        kubectl_cmd = "kubectl"
+    else:
+        console.print(
+            Padding(
+                f"[dim]Added to ~/.kube/config as context "
+                f"[/dim][bold]{result.context}[/bold][dim] — your current context "
+                "was left untouched.[/dim]",
+                (0, 0, 0, 2),
+            )
+        )
+        kubectl_cmd = f"kubectl --context {result.context}"
+
+    console.print()
+    if result.api_reachable:
+        console.print(Padding("Use it from any terminal:", (0, 0, 0, 2)))
+        console.print(Padding(f"[dim]{kubectl_cmd} get nodes[/dim]", (0, 0, 0, 4)))
     else:
         # 포트가 막힌 것은 흔한 정상 상황이다. 실패로 처리하지 않고 방법을 안내한다.
         console.print(
@@ -480,8 +508,8 @@ def up(
         console.print(Padding("then point kubectl at the tunnel:", (0, 0, 0, 4)))
         console.print(
             Padding(
-                f"[dim]$env:KUBECONFIG=\"{result.kubeconfig}\"; "
-                f"kubectl --server https://127.0.0.1:{cluster.API_PORT} get nodes[/dim]",
+                f"[dim]{kubectl_cmd} --server https://127.0.0.1:{cluster.API_PORT} "
+                "get nodes[/dim]",
                 (0, 0, 0, 6),
             )
         )

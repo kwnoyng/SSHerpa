@@ -258,15 +258,23 @@ class TestUpHealOrchestration:
     가짜 주소로는 SSH 가 안 되므로 분기 자체는 여기서 mock 으로 돈다.
     """
 
-    def _wire(self, monkeypatch, coverage_answers):
+    def _wire(self, monkeypatch, tmp_path, coverage_answers):
         """up() 의 원격 의존을 전부 가짜로 바꾼다."""
         calls = {"steps": [], "coverage": list(coverage_answers)}
+
+        fake_kubeconfig = tmp_path / "kc.yaml"
+        fake_kubeconfig.write_text("apiVersion: v1\n")
 
         monkeypatch.setattr(cluster, "is_installed", lambda *_a: True)
         monkeypatch.setattr(cluster, "wait_for_ready", lambda *_a: None)
         monkeypatch.setattr(cluster, "api_reachable", lambda *_a, **_k: True)
+        monkeypatch.setattr(cluster, "fetch_kubeconfig", lambda *_a: fake_kubeconfig)
         monkeypatch.setattr(
-            cluster, "fetch_kubeconfig", lambda *_a: cluster.kubeconfig_path("t")
+            cluster.kubeconf,
+            "merge",
+            lambda *_a, **_k: cluster.kubeconf.MergeResult(
+                context="ssherpa-t", became_current=True, backup=None
+            ),
         )
         monkeypatch.setattr(
             cluster,
@@ -280,8 +288,8 @@ class TestUpHealOrchestration:
         )
         return calls
 
-    def test_mismatch_triggers_refresh_and_reports_it(self, monkeypatch):
-        calls = self._wire(monkeypatch, coverage_answers=[False, True])
+    def test_mismatch_triggers_refresh_and_reports_it(self, monkeypatch, tmp_path):
+        calls = self._wire(monkeypatch, tmp_path, coverage_answers=[False, True])
         node = cluster.nodes_for_host_mode(TARGET)[0]
 
         result = cluster.up(node, distro_mod.get("k3s"))
@@ -289,8 +297,8 @@ class TestUpHealOrchestration:
         assert calls["steps"] == ["refresh certificate"]
         assert result.certificate_refreshed is True
 
-    def test_matching_certificate_is_left_alone(self, monkeypatch):
-        calls = self._wire(monkeypatch, coverage_answers=[True])
+    def test_matching_certificate_is_left_alone(self, monkeypatch, tmp_path):
+        calls = self._wire(monkeypatch, tmp_path, coverage_answers=[True])
         node = cluster.nodes_for_host_mode(TARGET)[0]
 
         result = cluster.up(node, distro_mod.get("k3s"))
@@ -298,9 +306,9 @@ class TestUpHealOrchestration:
         assert calls["steps"] == []
         assert result.certificate_refreshed is False
 
-    def test_indeterminate_certificate_does_not_block(self, monkeypatch):
+    def test_indeterminate_certificate_does_not_block(self, monkeypatch, tmp_path):
         # openssl 이 없어 판단 불가(None)면 치유를 시도하지 않고 진행한다
-        calls = self._wire(monkeypatch, coverage_answers=[None])
+        calls = self._wire(monkeypatch, tmp_path, coverage_answers=[None])
         node = cluster.nodes_for_host_mode(TARGET)[0]
 
         result = cluster.up(node, distro_mod.get("k3s"))
@@ -308,9 +316,9 @@ class TestUpHealOrchestration:
         assert calls["steps"] == []
         assert result.certificate_refreshed is False
 
-    def test_failed_heal_raises_instead_of_lying(self, monkeypatch):
+    def test_failed_heal_raises_instead_of_lying(self, monkeypatch, tmp_path):
         # 치유했는데도 인증서가 그대로면 'Cluster ready' 라고 하면 안 된다
-        self._wire(monkeypatch, coverage_answers=[False, False])
+        self._wire(monkeypatch, tmp_path, coverage_answers=[False, False])
         node = cluster.nodes_for_host_mode(TARGET)[0]
 
         with pytest.raises(cluster.ClusterError, match="still does not cover"):

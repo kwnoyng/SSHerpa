@@ -5,6 +5,7 @@
 (vm 모드) 알지 못한다. 덕분에 vm 모드가 추가돼도 이 파일은 바뀌지 않는다.
 """
 
+import contextlib
 import re
 import socket
 import time
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from . import kubeconfig as kubeconf
 from .distro import Distro, Step
 from .ssh import CommandResult, Target, run
 
@@ -227,6 +229,9 @@ class UpResult:
     api_reachable: bool
     already_installed: bool
     certificate_refreshed: bool = False
+    context: Optional[str] = None  # ~/.kube/config 에 병합된 컨텍스트 이름
+    context_is_current: bool = False  # current-context 로 잡혔나
+    merge_error: Optional[str] = None  # 병합 실패 사유 (클러스터 자체는 정상)
 
 
 def up(node: Node, distro: Distro, reporter=None) -> UpResult:
@@ -275,6 +280,22 @@ def up(node: Node, distro: Distro, reporter=None) -> UpResult:
     with reporter.step("fetch kubeconfig"):
         path = fetch_kubeconfig(node, distro, api_address)
 
+    # 병합은 편의 기능이다. 사용자의 ~/.kube/config 가 깨져 있어도 클러스터는
+    # 정상이므로, 여기서 실패해도 up 전체를 실패로 만들지 않는다 — 대신
+    # 사유를 담아 보내 CLI 가 경고와 대안(환경변수)을 안내하게 한다.
+    context = None
+    is_current = False
+    merge_error = None
+    with reporter.step("update ~/.kube/config"):
+        try:
+            merged = kubeconf.merge(
+                path.read_text(encoding="utf-8"), node.name
+            )
+            context = merged.context
+            is_current = merged.became_current
+        except kubeconf.KubeconfigError as exc:
+            merge_error = str(exc)
+
     with reporter.step("verify api access"):
         reachable = api_reachable(api_address)
 
@@ -284,6 +305,9 @@ def up(node: Node, distro: Distro, reporter=None) -> UpResult:
         api_reachable=reachable,
         already_installed=already,
         certificate_refreshed=refreshed,
+        context=context,
+        context_is_current=is_current,
+        merge_error=merge_error,
     )
 
 
@@ -318,6 +342,10 @@ def down(node: Node, distro: Distro, reporter=None) -> bool:
     path = kubeconfig_path(node.name)
     if path.exists():
         path.unlink()
+
+    # ~/.kube/config 의 우리 항목도 걷어낸다. 실패해도 제거 자체는 성공이다.
+    with contextlib.suppress(kubeconf.KubeconfigError):
+        kubeconf.remove(node.name)
 
     return True
 
