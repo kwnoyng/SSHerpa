@@ -374,14 +374,19 @@ def _installed_on(node) -> list[str]:
     return [d.name for d in host.installed]
 
 
-def _distro_to_install(node):
+def _distro_to_install(
+    node, requested: Optional[str] = None, installed: Optional[list] = None
+):
     """설치 대상을 정한다.
 
     한 호스트에는 배포판 하나만 존재할 수 있다(모두 6443 과 /etc/rancher 를
-    공유한다). 그래서 고를 일이 생기는 건 '아무것도 없을 때' 뿐이고, 그때만
-    물어본다. 이미 있으면 그것을 그대로 따르므로 충돌이 발생할 수 없다.
+    공유한다). 고를 일이 생기는 건 '아무것도 없을 때' 뿐이다:
+    사람이 있으면 화살표로 묻고, 스크립트는 --distro 로 지정하며,
+    지정 없는 스크립트는 k3s 를 기본으로 쓰되 그 사실을 로그에 남긴다 —
+    조용히 내린 결정은 나중에 읽는 사람에게 미스터리가 된다.
     """
-    installed = _installed_on(node)
+    if installed is None:
+        installed = _installed_on(node)
 
     if len(installed) > 1:
         _fail(
@@ -393,10 +398,32 @@ def _distro_to_install(node):
         )
 
     if installed:
-        return _resolve_distro(installed[0])
+        existing = installed[0]
+        if requested and requested != existing:
+            _fail(
+                f"{existing} is already installed on this host",
+                [
+                    "Kubernetes distributions cannot share a host — "
+                    "they all bind port 6443.",
+                    "Remove the existing one first:",
+                    "",
+                    f"    ssherpa down {node.target.name}",
+                ],
+            )
+        return _resolve_distro(existing)
 
-    # 스크립트로 실행되면 물어볼 수 없으므로 가벼운 쪽을 쓴다.
+    if requested:
+        return _resolve_distro(requested)
+
     if not _interactive():
+        console.print()
+        console.print(
+            Padding(
+                "[dim]No terminal to ask which distribution — defaulting to k3s. "
+                "Pass --distro to choose.[/dim]",
+                (0, 0, 0, 2),
+            )
+        )
         return _resolve_distro("k3s")
 
     return _prompt_for_distro()
@@ -412,18 +439,28 @@ def _load_target(name: str) -> Target:
 @app.command("up")
 def up(
     name: str = typer.Argument(..., help="Registered target name"),
+    distro: Optional[str] = typer.Option(
+        None,
+        "--distro",
+        help=f"Choose without prompting ({distro_mod.names()}) — for scripts",
+    ),
     assume_yes: bool = typer.Option(
         False, "--yes", "-y", help="Do not ask for confirmation"
     ),
 ) -> None:
     """Install Kubernetes on a target host.
 
-    Asks which distribution to install when the host is empty. If one is
-    already installed it is detected and left alone, so re-running is safe.
+    Asks which distribution to install when the host is empty (pass --distro
+    to skip the question, e.g. in scripts). If one is already installed it is
+    detected and left alone, so re-running is safe.
     """
     target = _load_target(name)
     node = cluster.nodes_for_host_mode(target)[0]
     already_installed = _installed_on(node)
+
+    # 충돌(--distro 가 설치본과 다름)은 재실행 안내보다 먼저 판정해야 한다 —
+    # "재설치는 안 한다"고 말해놓고 거부하면 앞뒤가 안 맞는다.
+    chosen = _distro_to_install(node, distro, installed=already_installed)
 
     if already_installed:
         console.print()
@@ -444,8 +481,6 @@ def up(
         console.print()
         if not _confirm("Continue?", assume_yes=assume_yes):
             raise typer.Exit(code=1)
-
-    chosen = _distro_to_install(node)
 
     console.print()
     console.print(
