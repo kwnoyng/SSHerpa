@@ -69,9 +69,64 @@ class TestPermissionOrdering:
         err = classify(self.RAW, TARGET_WITH_KEY)
         assert "permissions are too open" in err.message
 
-    def test_suggests_chmod_with_actual_path(self):
+    def test_fix_command_mentions_the_actual_path(self):
         err = classify(self.RAW, TARGET_WITH_KEY)
-        assert any("chmod 600 /tmp/k" in hint for hint in err.hints)
+        assert any("/tmp/k" in hint for hint in err.hints)
+
+    def test_windows_wording_is_recognized(self):
+        # 구버전 Windows OpenSSH 는 POSIX 배너 대신 이 문구를 쓴다.
+        raw = (
+            'Bad permissions. Try removing permissions for user: '
+            'DESKTOP\\Someone (S-1-5-21-...) on file C:/Users/k/key.pem.\n'
+            "admin@h: Permission denied (publickey)."
+        )
+        err = classify(raw, TARGET_WITH_KEY)
+        assert "permissions are too open" in err.message
+
+
+class TestPermissionFixHints:
+    """처방은 ssh 를 실행하는 쪽(제어 노드)의 OS 언어여야 한다.
+
+    Windows 사용자에게 chmod 를 안내하면: PowerShell 에선 명령이 없고,
+    Git Bash 에선 성공한 척하지만 ACL 은 그대로라 같은 오류가 반복된다.
+    """
+
+    def test_posix_gets_chmod(self):
+        hints = ssh._permission_fix_hints("/tmp/k", windows=False)
+        assert any("chmod 600 /tmp/k" in hint for hint in hints)
+        assert not any("icacls" in hint for hint in hints)
+
+    def test_windows_gets_icacls(self, monkeypatch):
+        monkeypatch.setenv("USERNAME", "kwnoyng")
+        hints = ssh._permission_fix_hints(r"C:\Users\k\Downloads\aws.pem", windows=True)
+        joined = "\n".join(hints)
+        assert 'icacls "C:\\Users\\k\\Downloads\\aws.pem"' in joined
+        assert "/inheritance:r" in joined
+        assert "chmod" not in joined
+
+    def test_windows_resets_before_restricting(self, monkeypatch):
+        # /inheritance:r 만으로는 '명시적으로' 부여된 Everyone 이 남는다
+        # (실측). /reset 이 먼저 와야 상속·명시 모두 걷어낸다.
+        monkeypatch.setenv("USERNAME", "kwnoyng")
+        hints = [h for h in ssh._permission_fix_hints("k", windows=True) if "icacls" in h]
+        assert len(hints) == 2
+        assert "/reset" in hints[0]
+        assert "/inheritance:r" in hints[1]
+
+    def test_windows_command_has_resolved_username(self, monkeypatch):
+        # %USERNAME% 템플릿은 PowerShell 에서 확장되지 않는다 —
+        # 어느 셸에든 그대로 붙여넣게 실제 이름이 들어가야 한다
+        monkeypatch.setenv("USERNAME", "kwnoyng")
+        hints = ssh._permission_fix_hints("k", windows=True)
+        assert any('"kwnoyng:F"' in hint for hint in hints)
+        assert not any("%USERNAME%" in hint for hint in hints)
+
+    def test_current_platform_is_autodetected(self):
+        import os as os_mod
+
+        hints = ssh._permission_fix_hints("k")
+        expects_icacls = os_mod.name == "nt"
+        assert any("icacls" in hint for hint in hints) is expects_icacls
 
 
 class TestAuthHints:

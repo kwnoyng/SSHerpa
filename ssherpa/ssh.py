@@ -105,6 +105,41 @@ def _auth_hints(target: Target) -> list[str]:
     ]
 
 
+def _permission_fix_hints(key_path: str, windows: Optional[bool] = None) -> list[str]:
+    """개인키 권한 오류의 처방.
+
+    같은 규칙('개인키는 나만')이지만 권한 체계가 달라 명령이 다르다.
+    POSIX 는 모드 비트(chmod 600), Windows 는 ACL(icacls). Windows 사용자에게
+    chmod 를 안내하면 Git Bash 에선 성공한 것처럼 보이면서 ACL 은 그대로라
+    같은 오류가 반복된다 — 처방은 ssh 를 실행하는 이쪽 OS 를 따라야 한다.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+
+    if windows:
+        # %USERNAME% 은 cmd 전용이고 PowerShell 에선 확장되지 않는다.
+        # 셸에 상관없이 붙여넣어 동작하도록 실제 사용자 이름을 채워 넣는다.
+        #
+        # /reset 이 먼저다. 흔히 도는 한 줄짜리(/inheritance:r + /grant:r)는
+        # '상속된' 넓은 권한만 지운다 — Everyone 이 명시적으로 부여된 파일에선
+        # 실측 결과 그대로 남았다. /reset 은 명시 항목까지 걷어낸다.
+        user = os.environ.get("USERNAME") or "<your-username>"
+        return [
+            "Windows refuses private keys that other accounts can access.",
+            "Restrict the file to yourself and try again:",
+            "",
+            f'    icacls "{key_path}" /reset',
+            f'    icacls "{key_path}" /inheritance:r /grant:r "{user}:F"',
+        ]
+
+    return [
+        "macOS/Linux refuse private keys that others can read.",
+        "Restrict the file and try again:",
+        "",
+        f"    chmod 600 {key_path}",
+    ]
+
+
 def _classify(stderr: str, target: Target) -> SSHError:
     """ssh 의 stderr 를 보고 사람이 읽을 수 있는 오류로 변환한다."""
     lower = stderr.lower()
@@ -153,16 +188,17 @@ def _classify(stderr: str, target: Target) -> SSHError:
     # 권한 문제는 permission denied 보다 먼저 본다. ssh 는 키를 무시한 뒤
     # 결국 'Permission denied' 도 같이 뱉기 때문에, 순서가 바뀌면
     # 원인(파일 권한)이 아니라 증상(인증 실패)만 안내하게 된다.
-    if "are too open" in lower or "unprotected private key" in lower:
+    # 'bad permissions' 는 Windows OpenSSH 전용 문구다:
+    #   "Bad permissions. Try removing permissions for user: ..."
+    if (
+        "are too open" in lower
+        or "unprotected private key" in lower
+        or "bad permissions" in lower
+    ):
         key = target.key or "<your private key>"
         return SSHError(
             "private key ignored: file permissions are too open",
-            [
-                "macOS/Linux refuse private keys that others can read.",
-                "Restrict the file and try again:",
-                "",
-                f"    chmod 600 {key}",
-            ],
+            _permission_fix_hints(key),
         )
 
     if "permission denied" in lower:
