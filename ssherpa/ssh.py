@@ -5,6 +5,7 @@ paramiko 대신 시스템의 OpenSSH 클라이언트를 subprocess 로 호출한
   - Windows 11 은 OpenSSH 클라이언트를 기본 포함한다
 """
 
+import getpass
 import os
 import shutil
 import subprocess
@@ -95,6 +96,18 @@ def _auth_hints(target: Target) -> list[str]:
         f"(append it to ~/.ssh/authorized_keys for '{user_label}')."
     )
 
+    # --user 를 생략하면 ssh 는 config 의 User, 없으면 '내 로컬 사용자명'으로
+    # 로그인한다. 서버엔 그런 계정이 없는 경우가 많은데, 어느 이름으로
+    # 시도했는지 말해주지 않으면 사용자는 키 문제로 오인한다 (실화).
+    user_note = []
+    if not target.user:
+        local = getpass.getuser()
+        user_note = [
+            f"No --user was given, so ssh logged in as '{local}' (your local",
+            "username) unless ~/.ssh/config says otherwise. If the server",
+            "expects a different account, pass --user.",
+        ]
+
     if target.key:
         hints = [
             f"The key you specified was rejected:  {target.key}",
@@ -102,11 +115,12 @@ def _auth_hints(target: Target) -> list[str]:
         ]
         if target.user:
             hints.append(f"Also verify the username '{target.user}' is correct.")
-        return hints
+        return hints + user_note
 
     defaults = _find_default_keys()
     if defaults:
         return [
+            *user_note,
             "No --key was given, so these default keys were tried and rejected:",
             *[f"    {path}" for path in defaults],
             "Pass --key to use a different key, or:",

@@ -208,3 +208,18 @@ class TestSshConfigRespect:
         err = ssh._classify("x: Permission denied (publickey).", self.ALIAS)
         assert "None" not in err.message
         assert all("None" not in hint for hint in err.hints)
+
+    def test_auth_failure_without_user_names_the_attempted_login(self, monkeypatch):
+        # --user 생략 시 ssh 는 로컬 사용자명으로 로그인한다. 어느 이름으로
+        # 시도했는지 말해주지 않으면 키 문제로 오인한다 (실사용에서 발생).
+        monkeypatch.setattr(ssh.getpass, "getuser", lambda: "kwnoyng")
+        monkeypatch.setattr(ssh, "_find_default_keys", lambda: ["/home/x/.ssh/id_ed25519"])
+        err = ssh._classify("x: Permission denied (publickey).", self.ALIAS)
+        joined = "\n".join(err.hints)
+        assert "'kwnoyng'" in joined
+        assert "--user" in joined
+
+    def test_auth_failure_with_user_has_no_local_username_note(self, monkeypatch):
+        monkeypatch.setattr(ssh, "_find_default_keys", lambda: ["/home/x/.ssh/id_ed25519"])
+        err = ssh._classify("x: Permission denied (publickey).", TARGET)
+        assert "local" not in "\n".join(err.hints)
