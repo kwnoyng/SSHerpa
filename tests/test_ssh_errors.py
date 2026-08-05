@@ -174,6 +174,40 @@ class TestBuildCommand:
         assert "-p" in argv and "2222" in argv
 
 
+class TestDestinationIsNotReadAsAnOption:
+    """'-' 로 시작하는 주소를 ssh 가 옵션으로 읽으면 임의 명령이 실행된다.
+
+    실측(OpenSSH 9.6): `ssh -oProxyCommand=... host` 는 그 명령을 실행하지만,
+    `ssh -- -oProxyCommand=...` 는 같은 값을 호스트 이름으로 취급한다.
+    """
+
+    HOSTILE = "-oProxyCommand=touch /tmp/pwn"
+
+    def test_separator_precedes_the_destination(self):
+        argv = ssh._build_command(TARGET, "true")
+        assert argv[-3] == "--"
+
+    def test_hostile_host_lands_after_the_separator(self):
+        argv = ssh._build_command(Target(name=None, host=self.HOSTILE), "true")
+        assert argv.index("--") < argv.index(self.HOSTILE)
+
+    def test_separator_survives_every_option_combination(self):
+        full = Target(
+            name=None, host=self.HOSTILE, user="admin", port=2222,
+            key="/tmp/k", jump="bastion",
+        )
+        argv = ssh._build_command(full, "whoami")
+        assert argv[-3:] == ["--", f"admin@{self.HOSTILE}", "whoami"]
+
+    def test_looks_like_option_flags_leading_dash(self):
+        assert ssh.looks_like_option(self.HOSTILE)
+        assert ssh.looks_like_option("-J evil")
+
+    def test_looks_like_option_accepts_real_addresses(self):
+        for host in ("10.0.0.10", "lab-01", "host.example.com", "2001:db8::1"):
+            assert not ssh.looks_like_option(host)
+
+
 class TestProxyJump:
     """NAT 뒤의 VM 은 호스트를 경유해서만 닿는다 (-J)."""
 

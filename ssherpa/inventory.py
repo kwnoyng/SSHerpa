@@ -15,9 +15,16 @@ from typing import Optional
 
 import yaml
 
-from .ssh import Target
+from .ssh import Target, looks_like_option
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+# 주소가 '-' 로 시작하면 ssh 가 그것을 옵션으로 읽는다. 인벤토리는 한 번
+# 적어두면 이후 모든 명령이 말없이 쓰는 값이라, 들어오는 자리에서 막는다.
+HOST_OPTION_HINT = [
+    "An address cannot start with '-' — ssh would read it as an option",
+    "instead of a destination.",
+]
 
 
 class InventoryError(Exception):
@@ -99,6 +106,9 @@ def add_target(
             "Must start with a letter or digit and contain only "
             "letters, digits, '-', '_', '.'"
         )
+
+    if looks_like_option(host):
+        raise InventoryError(f"'{host}' is not a valid address.\n" + "\n".join(HOST_OPTION_HINT))
 
     data = _load_raw()
     if name in data["all"]["hosts"]:

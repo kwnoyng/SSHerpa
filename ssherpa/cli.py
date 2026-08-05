@@ -21,6 +21,7 @@ from . import kubeconfig as kubeconf
 from . import vm as vm_mod
 from .cluster import ClusterError
 from .inventory import (
+    HOST_OPTION_HINT,
     InventoryError,
     add_target,
     get_target,
@@ -28,7 +29,7 @@ from .inventory import (
     list_targets,
     remove_target,
 )
-from .ssh import SSHError, Target, run
+from .ssh import SSHError, Target, looks_like_option, run
 from .virt import VirtError
 from .vm import VmError
 
@@ -118,6 +119,31 @@ def _surface_errors():
         _fail(exc.message, exc.hints)
     except InventoryError as exc:
         _fail(str(exc))
+
+
+def _resolve_target(
+    name: Optional[str],
+    host: Optional[str],
+    user: Optional[str],
+    port: Optional[int],
+    key: Optional[str],
+) -> Target:
+    """등록된 타겟 이름이든 일회성 --host 든 하나의 Target 으로 만든다.
+
+    check 와 doctor 가 같은 규칙을 쓴다 — 인자 해석이 두 벌로 갈라지면
+    한쪽만 고쳐지는 일이 생긴다.
+    """
+    if name:
+        if host or user:
+            _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
+        with _surface_errors():
+            return get_target(name)
+
+    if not host:
+        _fail("A target name or --host is required.", USAGE_HINTS)
+    if looks_like_option(host):
+        _fail(f"'{host}' is not a valid address.", HOST_OPTION_HINT)
+    return Target(name=None, host=host, user=user, port=port, key=key)
 
 
 class StepReporter:
@@ -262,15 +288,7 @@ def doctor(
     "can this host create VMs". A host that fails here can still run
     host-mode clusters — the verdict says which way to go.
     """
-    if name:
-        if host or user:
-            _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
-        with _surface_errors():
-            target = get_target(name)
-    else:
-        if not host:
-            _fail("A target name or --host is required.", USAGE_HINTS)
-        target = Target(name=None, host=host, user=user, port=port, key=key)
+    target = _resolve_target(name, host, user, port, key)
 
     with _surface_errors():
         result = run(target, doctor_mod.DOCTOR_PROBE, timeout=60)
@@ -331,15 +349,7 @@ def check(
     It does not leave a session open.
     """
     # 인벤토리에 등록된 타겟이든, 일회성 --host 든 둘 다 받는다.
-    if name:
-        if host or user:
-            _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
-        with _surface_errors():
-            target = get_target(name)
-    else:
-        if not host:
-            _fail("A target name or --host is required.", USAGE_HINTS)
-        target = Target(name=None, host=host, user=user, port=port, key=key)
+    target = _resolve_target(name, host, user, port, key)
 
     label = target.name or target.host
 
