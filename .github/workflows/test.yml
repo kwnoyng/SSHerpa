@@ -1,0 +1,35 @@
+# Lint and unit tests on every push and pull request.
+#
+# The publish workflow runs the same gate at release time, but that alone
+# means broken code can merge and only fail weeks later when a tag is cut.
+# This closes that gap.
+#
+# 3.9 is in the matrix because pyproject declares requires-python >= 3.9 —
+# a floor nobody develops on locally, so only CI keeps that claim honest.
+
+name: test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+# A newer push to the same branch supersedes the running check.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest

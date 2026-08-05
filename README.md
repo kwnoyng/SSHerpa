@@ -1,5 +1,8 @@
 # SSHerpa
 
+[![test](https://github.com/kwnoyng/SSHerpa/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/kwnoyng/SSHerpa/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/ssherpa)](https://pypi.org/project/ssherpa/)
+
 Build Kubernetes labs on a single on-premises server, over nothing but SSH.
 
 > **v0.2** — register a host, check that it is ready, and stand up a
