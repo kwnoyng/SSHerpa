@@ -59,6 +59,17 @@ class Target:
         return f"{self.destination()}:{self.port}" if self.port else self.destination()
 
 
+def looks_like_option(host: str) -> bool:
+    """ssh 가 목적지 대신 옵션으로 읽어버릴 주소인가.
+
+    '-oProxyCommand=...' 같은 값이 목적지 자리에 오면 ssh 는 그것을 옵션으로
+    해석해 임의의 명령을 실행한다. 비대화형 경로는 '--' 로 막지만(_build_command),
+    대화형 `ssherpa ssh` 는 사용자의 추가 인자를 ssh 에 그대로 넘겨야 해서
+    '--' 를 쓸 수 없다 — 그쪽은 값을 아예 들이지 않는 것이 유일한 방어다.
+    """
+    return host.startswith("-")
+
+
 @dataclass
 class CommandResult:
     rc: int
@@ -91,7 +102,12 @@ def _build_command(target: Target, remote_command: str) -> list[str]:
         argv += ["-i", os.path.expanduser(target.key)]
     if target.jump:
         argv += ["-J", target.jump]
-    argv += [target.destination(), remote_command]
+    # '--' 뒤로는 ssh 가 옵션을 찾지 않는다. 목적지가 '-' 로 시작하면
+    # (예: '-oProxyCommand=...') ssh 는 그것을 옵션으로 읽어 실행해 버린다.
+    # 여기서는 목적지 다음이 항상 우리가 만든 원격 명령이라 '--' 를 넣어도
+    # 잃는 것이 없다 — 대화형 ssh 는 사정이 달라서 값 자체를 막는다
+    # (looks_like_option 참고).
+    argv += ["--", target.destination(), remote_command]
     return argv
 
 

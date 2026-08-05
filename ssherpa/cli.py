@@ -21,6 +21,7 @@ from . import kubeconfig as kubeconf
 from . import vm as vm_mod
 from .cluster import ClusterError
 from .inventory import (
+    HOST_OPTION_HINT,
     InventoryError,
     add_target,
     get_target,
@@ -28,7 +29,7 @@ from .inventory import (
     list_targets,
     remove_target,
 )
-from .ssh import SSHError, Target, run
+from .ssh import SSHError, Target, looks_like_option, run
 from .virt import VirtError
 from .vm import VmError
 
@@ -118,6 +119,31 @@ def _surface_errors():
         _fail(exc.message, exc.hints)
     except InventoryError as exc:
         _fail(str(exc))
+
+
+def _resolve_target(
+    name: Optional[str],
+    host: Optional[str],
+    user: Optional[str],
+    port: Optional[int],
+    key: Optional[str],
+) -> Target:
+    """등록된 타겟 이름이든 일회성 --host 든 하나의 Target 으로 만든다.
+
+    check 와 doctor 가 같은 규칙을 쓴다 — 인자 해석이 두 벌로 갈라지면
+    한쪽만 고쳐지는 일이 생긴다.
+    """
+    if name:
+        if host or user:
+            _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
+        with _surface_errors():
+            return get_target(name)
+
+    if not host:
+        _fail("A target name or --host is required.", USAGE_HINTS)
+    if looks_like_option(host):
+        _fail(f"'{host}' is not a valid address.", HOST_OPTION_HINT)
+    return Target(name=None, host=host, user=user, port=port, key=key)
 
 
 class StepReporter:
@@ -262,15 +288,7 @@ def doctor(
     "can this host create VMs". A host that fails here can still run
     host-mode clusters — the verdict says which way to go.
     """
-    if name:
-        if host or user:
-            _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
-        with _surface_errors():
-            target = get_target(name)
-    else:
-        if not host:
-            _fail("A target name or --host is required.", USAGE_HINTS)
-        target = Target(name=None, host=host, user=user, port=port, key=key)
+    target = _resolve_target(name, host, user, port, key)
 
     with _surface_errors():
         result = run(target, doctor_mod.DOCTOR_PROBE, timeout=60)
@@ -331,15 +349,7 @@ def check(
     It does not leave a session open.
     """
     # 인벤토리에 등록된 타겟이든, 일회성 --host 든 둘 다 받는다.
-    if name:
-        if host or user:
-            _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
-        with _surface_errors():
-            target = get_target(name)
-    else:
-        if not host:
-            _fail("A target name or --host is required.", USAGE_HINTS)
-        target = Target(name=None, host=host, user=user, port=port, key=key)
+    target = _resolve_target(name, host, user, port, key)
 
     label = target.name or target.host
 
@@ -637,7 +647,12 @@ def _up_vm(name: str, target: Target, requested: Optional[str]) -> None:
         info = vm_mod.create(target, reporter=reporter)
         vm_mod.expose_api(target, info.ip, reporter)
         vm_node = cluster.Node(
-            name=f"{name}-vm", target=vm_mod.vm_target(target, info)
+            name=f"{name}-vm",
+            target=vm_mod.vm_target(target, info),
+            # 오류 힌트가 안내할 이름은 VM 의 합성 이름이 아니라 사용자가
+            # 등록한 타겟이다 — 그리고 그 안으로 들어가려면 --vm 이 필요하다.
+            cli_name=name,
+            in_vm=True,
         )
         # 인증서와 kubeconfig 에는 밖에서 닿는 주소(호스트)를 넣는다 —
         # VM 의 NAT 주소는 내 PC 의 kubectl 이 갈 수 없는 주소다.
@@ -738,9 +753,11 @@ def status(
     node = cluster.nodes_for_host_mode(target)[0]
     known = list(distro_mod.DISTROS.values())
 
+    # 호스트에 묻는 일은 전부 여기서 끝낸다. 출력 도중에 한 번 더 물으면
+    # 그때의 연결 실패는 이 블록 밖이라, 사람 말 대신 스택트레이스가 나간다.
     with _surface_errors():
         host = cluster.status(node, known)
-        vms = vm_mod.list_vms(target)
+        vms = [(vm, vm_mod.vm_state(target, vm)) for vm in vm_mod.list_vms(target)]
 
     table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
     table.add_column(no_wrap=True, style="bold")
@@ -760,8 +777,7 @@ def status(
     console.print(Padding(table, (0, 0, 0, 2)))
     console.print()
 
-    for vm_name in vms:
-        state = vm_mod.vm_state(target, vm_name)
+    for vm_name, state in vms:
         colour = "green" if state == "running" else "yellow"
         console.print(
             Padding(
@@ -837,6 +853,21 @@ def down(
     )
     console.print(Padding("[dim]Workloads and cluster state are lost.[/dim]", (0, 0, 0, 2)))
     console.print()
+
+    # 물어볼 자리가 없다고 해서 승낙은 아니다. up 은 되돌릴 수 있으니 조용히
+    # 진행해도 되지만, 여기서 잘못 진행하면 클러스터가 돌아오지 않는다 —
+    # 파괴는 명시적으로 요청받았을 때만 한다.
+    if not assume_yes and not _interactive():
+        _fail(
+            "Refusing to destroy a cluster without confirmation",
+            [
+                "There is no terminal to ask on, and this cannot be undone.",
+                "Say so explicitly if that is what you want:",
+                "",
+                f"    ssherpa down {name} --yes",
+            ],
+        )
+
     if not _confirm("Continue?", assume_yes=assume_yes):
         raise typer.Exit(code=1)
 

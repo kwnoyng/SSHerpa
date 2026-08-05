@@ -36,16 +36,56 @@ class Node:
     """클러스터를 구성하는 노드 하나.
 
     host 모드에서는 타겟 호스트 자신이고, vm 모드에서는 그 위에 만든 VM 이다.
+
+    cli_name/in_vm 은 오류 힌트에 넣을 명령을 짓기 위해서만 쓴다. 설치
+    로직은 이 값들을 보지 않는다 — 이 모듈이 노드의 정체를 모른다는 경계는
+    그대로다.
     """
 
     name: str
     target: Target
     role: str = "server"  # server | agent
+    cli_name: Optional[str] = None  # 사용자가 등록한 타겟 이름
+    in_vm: bool = False  # 이 노드가 호스트 위의 VM 인가
+
+    def _cli(self, verb: str, *flags: str) -> str:
+        parts = ["ssherpa", verb]
+        if self.cli_name:
+            parts.append(self.cli_name)
+        parts.extend(flags)
+        return " ".join(parts)
+
+    def cli_ssh(self) -> str:
+        """이 노드 안으로 들어가는 명령.
+
+        vm 모드에서 target.name 은 'lab-01/ssherpa-node-1' 같은 합성 이름이라
+        그대로 안내하면 등록되지 않은 타겟을 시키게 된다. 사용자가 실제로
+        타이핑하는 이름과, VM 안을 가리키는 --vm 을 쓴다.
+        """
+        return self._cli("ssh", "--vm") if self.in_vm else self._cli("ssh")
+
+    def cli_up(self, *flags: str) -> str:
+        """이 노드를 다시 세우는 명령."""
+        return self._cli("up", *flags, *(("--vm",) if self.in_vm else ()))
+
+    def cli_down(self) -> str:
+        """이 노드를 걷어내는 명령.
+
+        down 은 호스트에 무엇이 있든 스스로 찾으므로 모드 플래그가 없다.
+        """
+        return self._cli("down")
 
 
 def nodes_for_host_mode(target: Target) -> list[Node]:
     """호스트 자신을 유일한 노드로 삼는다."""
-    return [Node(name=target.name or target.host, target=target, role="server")]
+    return [
+        Node(
+            name=target.name or target.host,
+            target=target,
+            role="server",
+            cli_name=target.name,
+        )
+    ]
 
 
 class NullReporter:
@@ -110,9 +150,7 @@ def check_memory(node: Node, distro: Distro) -> None:
         hints += [
             "",
             "Or use a lighter distribution that fits:",
-            f"    ssherpa up {node.target.name or ''} --distro {alternatives[0]}".replace(
-                "  ", " "
-            ),
+            f"    {node.cli_up(f'--distro {alternatives[0]}')}",
         ]
 
     raise ClusterError(f"not enough memory for {distro.name}", hints)
@@ -139,7 +177,7 @@ def wait_for_ready(node: Node, distro: Distro) -> None:
         + (f" (last status: {last})" if last else ""),
         [
             "The install finished but the node never reported Ready.",
-            f"Inspect the service on the host:  ssherpa ssh {node.target.name or ''}".rstrip(),
+            f"Inspect the service:  {node.cli_ssh()}",
             f"    sudo journalctl -u {distro.name}-server -n 50",
         ],
     )
@@ -282,8 +320,8 @@ def up(
                     [
                         "The refresh did not take. Reinstalling will issue a "
                         "fresh certificate:",
-                        f"    ssherpa down {node.target.name or ''}".rstrip(),
-                        f"    ssherpa up {node.target.name or ''}".rstrip(),
+                        f"    {node.cli_down()}",
+                        f"    {node.cli_up()}",
                     ],
                 )
 
@@ -343,7 +381,7 @@ def down(node: Node, distro: Distro, reporter=None) -> bool:
                 f"{distro.name} is still installed after uninstall",
                 [
                     "The uninstall script reported success but left the binary behind.",
-                    f"Inspect the host:  ssherpa ssh {node.target.name or ''}".rstrip(),
+                    f"Inspect the host:  {node.cli_ssh()}",
                     f"    sudo systemctl status {distro.service}",
                 ],
             )

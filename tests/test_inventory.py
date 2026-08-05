@@ -67,6 +67,26 @@ class TestAdd:
         add_target(name, host="10.0.0.1", user="admin")
         assert get_target(name).name == name
 
+    @pytest.mark.parametrize(
+        "host", ["-oProxyCommand=touch /tmp/pwn", "-J evil", "-p2222"]
+    )
+    def test_addresses_ssh_would_read_as_options_are_rejected(self, host):
+        # 인벤토리는 한 번 적히면 이후 모든 명령이 말없이 쓰는 값이다.
+        # 대화형 `ssherpa ssh` 는 추가 인자를 그대로 넘겨야 해서 '--' 로
+        # 막을 수 없으므로, 들어오는 자리에서 거른다.
+        with pytest.raises(InventoryError, match="not a valid address"):
+            add_target("lab-01", host=host, user="admin")
+
+    def test_rejected_address_is_not_persisted(self, temp_inventory):
+        with pytest.raises(InventoryError):
+            add_target("lab-01", host="-oProxyCommand=x", user="admin")
+        assert not temp_inventory.exists()
+
+    @pytest.mark.parametrize("host", ["10.0.0.1", "lab", "host.example.com"])
+    def test_real_addresses_still_accepted(self, host):
+        add_target("lab-01", host=host)
+        assert get_target("lab-01").host == host
+
 
 class TestAnsibleFormat:
     """v0.2 에서 Ansible 롤을 변환 없이 붙이려면 이 구조가 유지돼야 한다."""

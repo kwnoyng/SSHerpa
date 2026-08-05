@@ -4,7 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ssherpa"
-version = "0.4.0"
+# 버전은 ssherpa/__init__.py 하나에만 적는다. 두 군데 적으면 릴리스 때
+# 한쪽만 올라가고, PyPI 는 새 버전인데 `ssherpa --version` 은 옛 버전을
+# 말하는 상태가 된다 — 사용자가 엉뚱한 버전으로 버그를 신고하게 된다.
+dynamic = ["version"]
 description = "Build lab environments on on-premises servers"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -26,6 +29,9 @@ dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 ssherpa = "ssherpa.cli:app"
+
+[tool.hatch.version]
+path = "ssherpa/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ssherpa"]

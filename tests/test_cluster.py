@@ -116,6 +116,66 @@ class TestNodes:
         assert cluster.nodes_for_host_mode(anonymous)[0].name == "10.0.0.1"
 
 
+class TestHintCommands:
+    """힌트에 적히는 명령은 사용자가 그대로 붙여넣어 동작해야 한다.
+
+    vm 모드에서 node.target.name 은 'lab-01/ssherpa-node-1' 같은 합성 이름이다.
+    그대로 안내하면 등록된 적 없는 타겟을 시키게 되어 'target not found' 로 끝난다.
+    """
+
+    HOST_NODE = cluster.nodes_for_host_mode(TARGET)[0]
+    VM_NODE = cluster.Node(
+        name="lab-01-vm",
+        target=Target(
+            name="lab-01/ssherpa-node-1", host="192.168.122.5", user="ssherpa"
+        ),
+        cli_name="lab-01",
+        in_vm=True,
+    )
+
+    def test_host_mode_addresses_the_registered_target(self):
+        assert self.HOST_NODE.cli_ssh() == "ssherpa ssh lab-01"
+        assert self.HOST_NODE.cli_down() == "ssherpa down lab-01"
+        assert self.HOST_NODE.cli_up() == "ssherpa up lab-01"
+
+    def test_vm_mode_never_leaks_the_compound_name(self):
+        for command in (
+            self.VM_NODE.cli_ssh(),
+            self.VM_NODE.cli_up(),
+            self.VM_NODE.cli_down(),
+        ):
+            assert "/" not in command
+
+    def test_vm_mode_reaches_inside_the_vm(self):
+        # 클러스터는 VM 안에서 돈다 — --vm 없이 들어가면 호스트에 닿는다
+        assert self.VM_NODE.cli_ssh() == "ssherpa ssh lab-01 --vm"
+        assert self.VM_NODE.cli_up() == "ssherpa up lab-01 --vm"
+
+    def test_down_needs_no_mode_flag(self):
+        # down 은 호스트에 무엇이 있든 스스로 찾는다
+        assert self.VM_NODE.cli_down() == "ssherpa down lab-01"
+
+    def test_flags_precede_the_mode_flag(self):
+        assert self.HOST_NODE.cli_up("--distro k3s") == "ssherpa up lab-01 --distro k3s"
+
+    def test_anonymous_target_leaves_no_double_space(self):
+        anonymous = cluster.nodes_for_host_mode(
+            Target(name=None, host="10.0.0.1", user="admin")
+        )[0]
+        for command in (anonymous.cli_ssh(), anonymous.cli_up(), anonymous.cli_down()):
+            assert "  " not in command
+            assert command == command.strip()
+
+    def test_ready_timeout_hint_points_into_the_vm(self, monkeypatch):
+        # 힌트를 짓는 쪽이 아니라 실제로 터지는 자리에서 확인한다.
+        monkeypatch.setattr(cluster, "READY_TIMEOUT", 0)
+        with pytest.raises(cluster.ClusterError) as caught:
+            cluster.wait_for_ready(self.VM_NODE, distro_mod.get("k3s"))
+        joined = "\n".join(caught.value.hints)
+        assert "ssherpa ssh lab-01 --vm" in joined
+        assert "ssherpa-node-1" not in joined
+
+
 class TestMemoryPreflight:
     """메모리가 모자라면 설치해도 노드가 Ready 가 되지 않는다.
 
