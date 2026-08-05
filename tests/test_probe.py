@@ -4,15 +4,16 @@
 실제 서버에서 나오는 문구를 그대로 넣어 검증한다.
 """
 
-from ssherpa.cli import _judge_sudo, _split_probe
+from ssherpa.probe import judge_sudo, split_probe
 
 OS_RELEASE = 'ID="rocky"\nVERSION_ID="9.8"\n'
 
 
-def probe(uid="1000", sudo_lines="", os_release=OS_RELEASE):
+def probe(uid="1000", user="admin", sudo_lines="", os_release=OS_RELEASE):
     """실제 PROBE 가 만들어내는 형태의 stdout 을 조립한다."""
     return (
         f"SSHERPA_UID={uid}\n"
+        f"SSHERPA_USER={user}\n"
         "SSHERPA_SUDO\n"
         f"{sudo_lines}"
         "SSHERPA_OSRELEASE\n"
@@ -21,55 +22,62 @@ def probe(uid="1000", sudo_lines="", os_release=OS_RELEASE):
 
 
 class TestSplitProbe:
-    def test_splits_three_sections(self):
-        uid, sudo, osr = _split_probe(probe(sudo_lines="SSHERPA_SUDO_RC=0\n"))
+    def test_splits_four_sections(self):
+        uid, user, sudo, osr = split_probe(probe(sudo_lines="SSHERPA_SUDO_RC=0\n"))
         assert uid == "1000"
+        assert user == "admin"
         assert "SSHERPA_SUDO_RC=0" in sudo
         assert 'ID="rocky"' in osr
 
+    def test_remote_username_is_captured(self):
+        # --user 없이 config 의 User 로 접속하면, 실제 계정명은 서버만 안다.
+        # sudoers 안내문에 정확한 이름을 넣으려면 이 값이 필요하다.
+        _, user, _, _ = split_probe(probe(user="deploy"))
+        assert user == "deploy"
+
     def test_os_release_section_is_clean(self):
         # sudo 구간의 문구가 os-release 로 새면 OS 감지가 깨진다
-        _, _, osr = _split_probe(
+        _, _, _, osr = split_probe(
             probe(sudo_lines="sudo: a password is required\nSSHERPA_SUDO_RC=1\n")
         )
         assert "password" not in osr
 
     def test_missing_os_release(self):
-        _, _, osr = _split_probe(probe(os_release=""))
+        _, _, _, osr = split_probe(probe(os_release=""))
         assert osr == ""
 
     def test_garbage_input_does_not_crash(self):
-        assert _split_probe("unexpected output") == ("", "", "")
+        assert split_probe("unexpected output") == ("", "", "", "")
 
 
 class TestJudgeSudo:
     def test_root_needs_no_sudo(self):
-        ok, detail, _ = _judge_sudo("0", "")
+        ok, detail, _ = judge_sudo("0", "")
         assert ok is True
         assert detail == "root account"
 
     def test_nopasswd(self):
-        ok, detail, _ = _judge_sudo("1000", "SSHERPA_SUDO_RC=0\n")
+        ok, detail, _ = judge_sudo("1000", "SSHERPA_SUDO_RC=0\n")
         assert ok is True
         assert detail == "NOPASSWD"
 
     def test_password_required(self):
         # sudoers 에 없는 계정도 sudo 는 일단 비밀번호부터 묻는다
-        ok, detail, _ = _judge_sudo(
+        ok, detail, _ = judge_sudo(
             "1000", "sudo: a password is required\nSSHERPA_SUDO_RC=1\n"
         )
         assert ok is False
         assert detail == "password required"
 
     def test_not_in_sudoers(self):
-        ok, detail, _ = _judge_sudo(
+        ok, detail, _ = judge_sudo(
             "1000", "user is not in the sudoers file.\nSSHERPA_SUDO_RC=1\n"
         )
         assert ok is False
         assert detail == "not in sudoers"
 
     def test_sudo_not_installed(self):
-        ok, detail, hints = _judge_sudo(
+        ok, detail, hints = judge_sudo(
             "1000", "bash: sudo: command not found\nSSHERPA_SUDO_RC=127\n"
         )
         assert ok is False
@@ -77,7 +85,7 @@ class TestJudgeSudo:
         assert hints  # 해결 방법을 반드시 제시한다
 
     def test_unknown_failure_surfaces_original_text(self):
-        ok, detail, hints = _judge_sudo(
+        ok, detail, hints = judge_sudo(
             "1000", "sudo: something bizarre happened\nSSHERPA_SUDO_RC=1\n"
         )
         assert ok is False

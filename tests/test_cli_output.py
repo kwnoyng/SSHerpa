@@ -107,6 +107,63 @@ class TestPromptSafety:
         assert cli._confirm("Continue?", assume_yes=False) is True
 
 
+class TestDistroSelection:
+    """빈 호스트에서만 고를 일이 생긴다: 사람은 화살표, 스크립트는 --distro,
+    지정 없는 스크립트는 k3s 기본 + 그 사실을 로그에 남긴다."""
+
+    def _node(self):
+        from ssherpa import cluster
+        from ssherpa.ssh import Target
+
+        return cluster.nodes_for_host_mode(Target(name="lab", host="h"))[0]
+
+    def _wire(self, monkeypatch, installed, interactive=False):
+        from ssherpa import cli
+
+        monkeypatch.setattr(cli, "_installed_on", lambda _n: installed)
+        monkeypatch.setattr(cli, "_interactive", lambda: interactive)
+
+    def test_script_can_choose_with_distro(self, monkeypatch):
+        from ssherpa import cli
+
+        self._wire(monkeypatch, installed=[])
+        assert cli._distro_to_install(self._node(), "rke2").name == "rke2"
+
+    def test_mismatch_with_installed_is_refused(self, monkeypatch):
+        # 예전 사고 재발 방지: rke2 가 있는데 k3s 를 요청하면 6443 충돌로
+        # 몇 분 뒤에 죽는 대신, 시작 전에 거부해야 한다
+        import typer
+
+        from ssherpa import cli
+
+        self._wire(monkeypatch, installed=["rke2"])
+        with pytest.raises(typer.Exit):
+            cli._distro_to_install(self._node(), "k3s")
+
+    def test_matching_request_follows_installed(self, monkeypatch):
+        from ssherpa import cli
+
+        self._wire(monkeypatch, installed=["rke2"])
+        assert cli._distro_to_install(self._node(), "rke2").name == "rke2"
+
+    def test_silent_default_announces_itself(self, monkeypatch):
+        from ssherpa import cli
+
+        self._wire(monkeypatch, installed=[], interactive=False)
+        with cli.console.capture() as captured:
+            chosen = cli._distro_to_install(self._node(), None)
+        assert chosen.name == "k3s"
+        assert "defaulting to k3s" in captured.get()
+
+    def test_explicit_choice_is_not_announced(self, monkeypatch):
+        from ssherpa import cli
+
+        self._wire(monkeypatch, installed=[], interactive=False)
+        with cli.console.capture() as captured:
+            cli._distro_to_install(self._node(), "k3s")
+        assert "defaulting" not in captured.get()
+
+
 class TestExitCodes:
     """verify.ps1 / verify.sh 가 종료 코드로 판정하므로 계약이 고정돼야 한다."""
 

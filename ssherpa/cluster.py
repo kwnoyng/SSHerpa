@@ -5,6 +5,7 @@
 (vm 모드) 알지 못한다. 덕분에 vm 모드가 추가돼도 이 파일은 바뀌지 않는다.
 """
 
+import contextlib
 import re
 import socket
 import time
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from . import kubeconfig as kubeconf
 from .distro import Distro, Step
 from .ssh import CommandResult, Target, run
 
@@ -143,6 +145,37 @@ def wait_for_ready(node: Node, distro: Distro) -> None:
     )
 
 
+def parse_san_list(text: str) -> list[str]:
+    """openssl 의 subjectAltName 출력에서 주소만 뽑는다.
+
+    입력 형태:
+        X509v3 Subject Alternative Name:
+            DNS:kubernetes, DNS:localhost, IP Address:34.50.34.61, ...
+    """
+    values: list[str] = []
+    for line in text.splitlines():
+        for entry in line.split(","):
+            entry = entry.strip()
+            for prefix in ("DNS:", "IP Address:", "IP:"):
+                if entry.startswith(prefix):
+                    values.append(entry[len(prefix):].strip())
+                    break
+    return values
+
+
+def certificate_covers(node: Node, distro: Distro, address: str) -> Optional[bool]:
+    """serving 인증서가 이 주소를 포함하는지. 확인할 수 없으면 None.
+
+    kubectl 은 접속한 주소가 인증서 SAN 에 없으면 거부한다. 클라우드에서
+    중지/재시작으로 IP 가 바뀌면 인증서는 옛 주소로 남으므로, 여기서
+    걸러내지 않으면 '성공했는데 못 쓰는' kubeconfig 를 내주게 된다.
+    """
+    result = run(node.target, distro.read_san_command(), timeout=60)
+    if result.rc != 0 or "DNS:" not in result.stdout:
+        return None  # openssl 이 없거나 인증서를 못 읽음 — 판단 불가
+    return address in parse_san_list(result.stdout)
+
+
 def kubeconfig_dir() -> Path:
     return Path.home() / ".ssherpa" / "kubeconfig"
 
@@ -195,6 +228,10 @@ class UpResult:
     api_address: str
     api_reachable: bool
     already_installed: bool
+    certificate_refreshed: bool = False
+    context: Optional[str] = None  # ~/.kube/config 에 병합된 컨텍스트 이름
+    context_is_current: bool = False  # current-context 로 잡혔나
+    merge_error: Optional[str] = None  # 병합 실패 사유 (클러스터 자체는 정상)
 
 
 def up(node: Node, distro: Distro, reporter=None) -> UpResult:
@@ -215,8 +252,49 @@ def up(node: Node, distro: Distro, reporter=None) -> UpResult:
     with reporter.step("wait for node"):
         wait_for_ready(node, distro)
 
+    # 인증서가 지금 접속 주소를 포함하는지 확인한다. 클라우드에서 중지/재시작
+    # 으로 IP 가 바뀐 뒤 재실행하면, kubeconfig 만 갱신되고 인증서는 옛 주소로
+    # 남아 kubectl 이 전부 거부된다. 설정을 다시 쓰고 재시작하면 재발급된다.
+    refreshed = False
+    with reporter.step("verify certificate"):
+        covered = certificate_covers(node, distro, api_address)
+
+    if covered is False:
+        with reporter.step("refresh certificate"):
+            _run_step(node, distro.refresh_certificate_step(api_address))
+            refreshed = True
+        with reporter.step("wait for node"):
+            wait_for_ready(node, distro)
+        with reporter.step("verify certificate"):
+            if certificate_covers(node, distro, api_address) is False:
+                raise ClusterError(
+                    f"the certificate still does not cover {api_address}",
+                    [
+                        "The refresh did not take. Reinstalling will issue a "
+                        "fresh certificate:",
+                        f"    ssherpa down {node.target.name or ''}".rstrip(),
+                        f"    ssherpa up {node.target.name or ''}".rstrip(),
+                    ],
+                )
+
     with reporter.step("fetch kubeconfig"):
         path = fetch_kubeconfig(node, distro, api_address)
+
+    # 병합은 편의 기능이다. 사용자의 ~/.kube/config 가 깨져 있어도 클러스터는
+    # 정상이므로, 여기서 실패해도 up 전체를 실패로 만들지 않는다 — 대신
+    # 사유를 담아 보내 CLI 가 경고와 대안(환경변수)을 안내하게 한다.
+    context = None
+    is_current = False
+    merge_error = None
+    with reporter.step("update ~/.kube/config"):
+        try:
+            merged = kubeconf.merge(
+                path.read_text(encoding="utf-8"), node.name
+            )
+            context = merged.context
+            is_current = merged.became_current
+        except kubeconf.KubeconfigError as exc:
+            merge_error = str(exc)
 
     with reporter.step("verify api access"):
         reachable = api_reachable(api_address)
@@ -226,6 +304,10 @@ def up(node: Node, distro: Distro, reporter=None) -> UpResult:
         api_address=api_address,
         api_reachable=reachable,
         already_installed=already,
+        certificate_refreshed=refreshed,
+        context=context,
+        context_is_current=is_current,
+        merge_error=merge_error,
     )
 
 
@@ -260,6 +342,10 @@ def down(node: Node, distro: Distro, reporter=None) -> bool:
     path = kubeconfig_path(node.name)
     if path.exists():
         path.unlink()
+
+    # ~/.kube/config 의 우리 항목도 걷어낸다. 실패해도 제거 자체는 성공이다.
+    with contextlib.suppress(kubeconf.KubeconfigError):
+        kubeconf.remove(node.name)
 
     return True
 

@@ -25,14 +25,28 @@ SSH_FAILURE_RC = 255
 
 @dataclass
 class Target:
+    """접속 대상. user/port/key 는 '지정 안 함'(None) 이 유효한 상태다.
+
+    지정하지 않은 값은 ssh 에 아예 넘기지 않는다 — 그래야 ssh 가
+    ~/.ssh/config 의 User/Port/IdentityFile/ProxyJump 를 존중한다.
+    우리가 기본값 22 를 강제로 넘기면 config 의 Port 2222 를 덮어써서
+    'ssh 로는 되는데 SSHerpa 로는 안 되는' 미스터리를 만든다.
+    """
+
     name: Optional[str]
     host: str
-    user: str
-    port: int = 22
+    user: Optional[str] = None
+    port: Optional[int] = None
     key: Optional[str] = None
 
+    def destination(self) -> str:
+        """ssh 에 넘길 목적지. user 미지정이면 host 만 (config 가 정함)."""
+        return f"{self.user}@{self.host}" if self.user else self.host
+
     def endpoint(self) -> str:
-        return f"{self.user}@{self.host}:{self.port}"
+        """표시용 주소."""
+        end = self.destination()
+        return f"{end}:{self.port}" if self.port else end
 
 
 @dataclass
@@ -57,11 +71,13 @@ def _build_command(target: Target, remote_command: str) -> list[str]:
         "-o", "BatchMode=yes",              # 비밀번호 프롬프트 금지 (자동화용)
         "-o", f"ConnectTimeout={CONNECT_TIMEOUT}",
         "-o", "StrictHostKeyChecking=accept-new",
-        "-p", str(target.port),
     ]
+    # 명시된 것만 넘긴다. 안 넘긴 항목은 ssh 가 ~/.ssh/config 에서 찾는다.
+    if target.port:
+        argv += ["-p", str(target.port)]
     if target.key:
         argv += ["-i", os.path.expanduser(target.key)]
-    argv += [f"{target.user}@{target.host}", remote_command]
+    argv += [target.destination(), remote_command]
     return argv
 
 
@@ -73,17 +89,20 @@ def _find_default_keys() -> list[str]:
 
 def _auth_hints(target: Target) -> list[str]:
     """인증 실패는 원인이 여러 가지라, 상황에 맞는 안내만 골라서 준다."""
+    user_label = target.user or "the login user"
     install = (
         "Install the matching public key on the target "
-        f"(append it to ~/.ssh/authorized_keys for '{target.user}')."
+        f"(append it to ~/.ssh/authorized_keys for '{user_label}')."
     )
 
     if target.key:
-        return [
+        hints = [
             f"The key you specified was rejected:  {target.key}",
             install,
-            f"Also verify the username '{target.user}' is correct.",
         ]
+        if target.user:
+            hints.append(f"Also verify the username '{target.user}' is correct.")
+        return hints
 
     defaults = _find_default_keys()
     if defaults:
@@ -105,10 +124,50 @@ def _auth_hints(target: Target) -> list[str]:
     ]
 
 
+def _permission_fix_hints(key_path: str, windows: Optional[bool] = None) -> list[str]:
+    """개인키 권한 오류의 처방.
+
+    같은 규칙('개인키는 나만')이지만 권한 체계가 달라 명령이 다르다.
+    POSIX 는 모드 비트(chmod 600), Windows 는 ACL(icacls). Windows 사용자에게
+    chmod 를 안내하면 Git Bash 에선 성공한 것처럼 보이면서 ACL 은 그대로라
+    같은 오류가 반복된다 — 처방은 ssh 를 실행하는 이쪽 OS 를 따라야 한다.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+
+    if windows:
+        # %USERNAME% 은 cmd 전용이고 PowerShell 에선 확장되지 않는다.
+        # 셸에 상관없이 붙여넣어 동작하도록 실제 사용자 이름을 채워 넣는다.
+        #
+        # /reset 이 먼저다. 흔히 도는 한 줄짜리(/inheritance:r + /grant:r)는
+        # '상속된' 넓은 권한만 지운다 — Everyone 이 명시적으로 부여된 파일에선
+        # 실측 결과 그대로 남았다. /reset 은 명시 항목까지 걷어낸다.
+        user = os.environ.get("USERNAME") or "<your-username>"
+        return [
+            "Windows refuses private keys that other accounts can access.",
+            "Restrict the file to yourself and try again:",
+            "",
+            f'    icacls "{key_path}" /reset',
+            f'    icacls "{key_path}" /inheritance:r /grant:r "{user}:F"',
+        ]
+
+    return [
+        "macOS/Linux refuse private keys that others can read.",
+        "Restrict the file and try again:",
+        "",
+        f"    chmod 600 {key_path}",
+    ]
+
+
 def _classify(stderr: str, target: Target) -> SSHError:
     """ssh 의 stderr 를 보고 사람이 읽을 수 있는 오류로 변환한다."""
     lower = stderr.lower()
-    ep = f"{target.host}:{target.port}"
+    ep = f"{target.host}:{target.port}" if target.port else target.host
+    port_note = (
+        f"currently {target.port}"
+        if target.port
+        else "ssh default 22, or Port in your ~/.ssh/config"
+    )
 
     if "could not resolve hostname" in lower:
         return SSHError(
@@ -130,7 +189,7 @@ def _classify(stderr: str, target: Target) -> SSHError:
             f"connection refused ({ep})",
             [
                 "Check that sshd is running on the target host",
-                f"Check the port number (currently {target.port})",
+                f"Check the port number ({port_note})",
             ],
         )
 
@@ -153,21 +212,22 @@ def _classify(stderr: str, target: Target) -> SSHError:
     # 권한 문제는 permission denied 보다 먼저 본다. ssh 는 키를 무시한 뒤
     # 결국 'Permission denied' 도 같이 뱉기 때문에, 순서가 바뀌면
     # 원인(파일 권한)이 아니라 증상(인증 실패)만 안내하게 된다.
-    if "are too open" in lower or "unprotected private key" in lower:
+    # 'bad permissions' 는 Windows OpenSSH 전용 문구다:
+    #   "Bad permissions. Try removing permissions for user: ..."
+    if (
+        "are too open" in lower
+        or "unprotected private key" in lower
+        or "bad permissions" in lower
+    ):
         key = target.key or "<your private key>"
         return SSHError(
             "private key ignored: file permissions are too open",
-            [
-                "macOS/Linux refuse private keys that others can read.",
-                "Restrict the file and try again:",
-                "",
-                f"    chmod 600 {key}",
-            ],
+            _permission_fix_hints(key),
         )
 
     if "permission denied" in lower:
         return SSHError(
-            f"authentication failed ({target.user}@{target.host})",
+            f"authentication failed ({target.destination()})",
             _auth_hints(target),
         )
 
@@ -218,7 +278,7 @@ def run(
                 "This is often temporary — a busy host right after an install or",
                 "uninstall. Try the command again.",
                 "",
-                f"If it keeps happening, check the host:  ssh {target.user}@{target.host}",
+                f"If it keeps happening, check the host:  ssh {target.destination()}",
             ],
         ) from exc
 

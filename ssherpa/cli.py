@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.padding import Padding
 from rich.table import Table
 
-from . import __version__, cluster, facts, support
+from . import __version__, cluster, facts, probe, support
 from . import distro as distro_mod
 from .cluster import ClusterError
 from .inventory import (
@@ -80,6 +80,14 @@ def _print_checks(rows: list[tuple[str, bool, str]]) -> None:
     console.print(Padding(table, (0, 0, 0, 2)))
 
 
+def _say(text: str = "", indent: int = 2) -> None:
+    """들여쓰기 붙여 한 줄 출력. 인자 없이 부르면 빈 줄."""
+    if text:
+        console.print(Padding(text, (0, 0, 0, indent)))
+    else:
+        console.print()
+
+
 def _fail(message: str, hints: Optional[list[str]] = None) -> None:
     """실패 사유와 해결 방법을 출력하고 종료 코드 1 로 끝낸다."""
     err_console.print()
@@ -90,6 +98,21 @@ def _fail(message: str, hints: Optional[list[str]] = None) -> None:
             err_console.print(Padding(hint, (0, 0, 0, 4)))
     err_console.print()
     raise typer.Exit(code=1)
+
+
+@contextlib.contextmanager
+def _surface_errors():
+    """도메인 오류를 사람 말로 출력하고 종료 코드 1 로 끝낸다.
+
+    SSHError/ClusterError 는 (message, hints) 쌍을, InventoryError 는
+    문자열 하나를 갖는다 — 어느 쪽이든 _fail 로 모은다.
+    """
+    try:
+        yield
+    except (SSHError, ClusterError) as exc:
+        _fail(exc.message, exc.hints)
+    except InventoryError as exc:
+        _fail(str(exc))
 
 
 class StepReporter:
@@ -121,101 +144,26 @@ class StepReporter:
 
 
 # --------------------------------------------------------------------------
-# 원격 검사
-# --------------------------------------------------------------------------
-
-# 한 번의 접속으로 uid / sudo / os-release 를 모두 가져온다.
-PROBE = (
-    'echo "SSHERPA_UID=$(id -u)"; '
-    'echo "SSHERPA_SUDO"; '
-    "sudo -n true 2>&1; "
-    'echo "SSHERPA_SUDO_RC=$?"; '
-    'echo "SSHERPA_OSRELEASE"; '
-    "cat /etc/os-release 2>/dev/null"
-)
-
-
-def _split_probe(stdout: str) -> tuple[str, str, str]:
-    """PROBE 출력을 (uid, sudo구간, os-release) 로 나눈다."""
-    uid = ""
-    sudo_block: list[str] = []
-    osrelease: list[str] = []
-    section = "head"
-
-    for line in stdout.splitlines():
-        if line.startswith("SSHERPA_UID="):
-            uid = line.split("=", 1)[1].strip()
-        elif line == "SSHERPA_SUDO":
-            section = "sudo"
-        elif line == "SSHERPA_OSRELEASE":
-            section = "os"
-        elif section == "sudo":
-            sudo_block.append(line)
-        elif section == "os":
-            osrelease.append(line)
-
-    return uid, "\n".join(sudo_block), "\n".join(osrelease)
-
-
-def _judge_sudo(uid: str, sudo_block: str) -> tuple[bool, str, list[str]]:
-    """(통과여부, 표시문구, 힌트) 를 돌려준다."""
-    if uid == "0":
-        return True, "root account", []
-
-    rc = None
-    message_lines = []
-    for line in sudo_block.splitlines():
-        if line.startswith("SSHERPA_SUDO_RC="):
-            rc = line.split("=", 1)[1].strip()
-        else:
-            message_lines.append(line)
-    message = "\n".join(message_lines).lower()
-
-    if rc == "0":
-        return True, "NOPASSWD", []
-
-    if "command not found" in message or rc == "127":
-        return False, "sudo is not installed", [
-            "Install sudo on the target host, or use the root account",
-        ]
-
-    if "password is required" in message:
-        return False, "password required", []
-
-    if "not allowed" in message or "not in the sudoers" in message:
-        return False, "not in sudoers", []
-
-    return False, "sudo is unavailable", (
-        [line for line in message_lines if line.strip()][:2]
-    )
-
-
-def _sudo_fix_hint(user: str) -> list[str]:
-    return [
-        f"SSHerpa needs passwordless sudo for '{user}'.",
-        "Run this on the target host:",
-        "",
-        f"    echo '{user} ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/ssherpa",
-    ]
-
-
-# --------------------------------------------------------------------------
 # target 명령
 # --------------------------------------------------------------------------
 
 @target_app.command("add")
 def target_add(
     name: str = typer.Argument(..., help="Target name (e.g. lab-01)"),
-    host: str = typer.Option(..., "--host", help="IP address or hostname"),
-    user: str = typer.Option(..., "--user", help="SSH username"),
+    host: str = typer.Option(
+        ..., "--host", help="IP, hostname, or a Host alias from ~/.ssh/config"
+    ),
+    user: Optional[str] = typer.Option(
+        None, "--user", help="SSH username (omit to let ~/.ssh/config decide)"
+    ),
     key: Optional[str] = typer.Option(None, "--key", help="Path to SSH private key"),
-    port: int = typer.Option(22, "--port", help="SSH port"),
+    port: Optional[int] = typer.Option(
+        None, "--port", help="SSH port (omit to let ~/.ssh/config decide; ssh defaults to 22)"
+    ),
 ) -> None:
     """Register a target in the inventory. Does not connect."""
-    try:
+    with _surface_errors():
         target = add_target(name, host=host, user=user, port=port, key=key)
-    except InventoryError as exc:
-        _fail(str(exc))
 
     console.print()
     console.print(
@@ -233,10 +181,8 @@ def target_add(
 @target_app.command("list")
 def target_list() -> None:
     """List registered targets. Does not connect."""
-    try:
+    with _surface_errors():
         targets = list_targets()
-    except InventoryError as exc:
-        _fail(str(exc))
 
     if not targets:
         console.print()
@@ -258,7 +204,13 @@ def target_list() -> None:
     table.add_column("PORT", justify="right")
 
     for target in targets:
-        table.add_row(target.name, target.host, target.user, str(target.port))
+        # 비워둔 항목은 접속 시 ~/.ssh/config 가 정한다
+        table.add_row(
+            target.name,
+            target.host,
+            target.user or "[dim]—[/dim]",
+            str(target.port) if target.port else "[dim]—[/dim]",
+        )
 
     console.print()
     console.print(Padding(table, (0, 0, 0, 2)))
@@ -270,10 +222,8 @@ def target_remove(
     name: str = typer.Argument(..., help="Target name to remove"),
 ) -> None:
     """Remove a target from the inventory. Does not touch the remote host."""
-    try:
+    with _surface_errors():
         remove_target(name)
-    except InventoryError as exc:
-        _fail(str(exc))
 
     console.print()
     console.print(Padding(f"[green]✓[/green] [bold]{name}[/bold] removed", (0, 0, 0, 2)))
@@ -287,10 +237,16 @@ def target_remove(
 @app.command("check")
 def check(
     name: Optional[str] = typer.Argument(None, help="Registered target name"),
-    host: Optional[str] = typer.Option(None, "--host", help="IP or hostname (one-off)"),
-    user: Optional[str] = typer.Option(None, "--user", help="SSH username"),
+    host: Optional[str] = typer.Option(
+        None, "--host", help="IP, hostname, or ~/.ssh/config alias (one-off)"
+    ),
+    user: Optional[str] = typer.Option(
+        None, "--user", help="SSH username (omit to let ~/.ssh/config decide)"
+    ),
     key: Optional[str] = typer.Option(None, "--key", help="Path to SSH private key"),
-    port: int = typer.Option(22, "--port", help="SSH port"),
+    port: Optional[int] = typer.Option(
+        None, "--port", help="SSH port (omit to let ~/.ssh/config decide)"
+    ),
 ) -> None:
     """Check whether a host is ready for SSHerpa.
 
@@ -301,33 +257,37 @@ def check(
     if name:
         if host or user:
             _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
-        try:
+        with _surface_errors():
             target = get_target(name)
-        except InventoryError as exc:
-            _fail(str(exc))
     else:
-        if not host or not user:
-            _fail("A target name, or both --host and --user, are required.", USAGE_HINTS)
+        if not host:
+            _fail("A target name or --host is required.", USAGE_HINTS)
         target = Target(name=None, host=host, user=user, port=port, key=key)
 
     label = target.name or target.host
 
     # --- 1. SSH 연결 -------------------------------------------------------
     try:
-        result = run(target, PROBE)
+        result = run(target, probe.PROBE)
     except SSHError as exc:
         _print_checks([("SSH connection", False, exc.message)])
         _fail("Check the following:" if exc.hints else exc.message, exc.hints)
 
-    rows: list[tuple[str, bool, str]] = [("SSH connection", True, target.endpoint())]
-    uid, sudo_block, osrelease_text = _split_probe(result.stdout)
+    uid, remote_user, sudo_block, osrelease_text = probe.split_probe(result.stdout)
+
+    # --user 없이 config 의 User 로 접속한 경우, 실제 계정명은 서버가 알려준다
+    shown = target.endpoint()
+    if not target.user and remote_user:
+        shown = f"{remote_user}@{target.host}" + (f":{target.port}" if target.port else "")
+    rows: list[tuple[str, bool, str]] = [("SSH connection", True, shown)]
 
     # --- 2. sudo 권한 ------------------------------------------------------
-    sudo_ok, sudo_detail, sudo_hints = _judge_sudo(uid, sudo_block)
+    sudo_ok, sudo_detail, sudo_hints = probe.judge_sudo(uid, sudo_block)
     rows.append(("sudo access", sudo_ok, sudo_detail))
     if not sudo_ok:
         _print_checks(rows)
-        _fail("Passwordless sudo is required", sudo_hints or _sudo_fix_hint(target.user))
+        fix_user = remote_user or target.user or "<user>"
+        _fail("Passwordless sudo is required", sudo_hints or probe.sudo_fix_hint(fix_user))
 
     # --- 3. OS 감지 --------------------------------------------------------
     if not osrelease_text.strip():
@@ -422,21 +382,24 @@ def _confirm(question: str, *, assume_yes: bool) -> bool:
 
 def _installed_on(node) -> list[str]:
     """호스트에 설치된 배포판 이름 목록."""
-    try:
+    with _surface_errors():
         host = cluster.status(node, list(distro_mod.DISTROS.values()))
-    except SSHError as exc:
-        _fail(exc.message, exc.hints)
     return [d.name for d in host.installed]
 
 
-def _distro_to_install(node):
+def _distro_to_install(
+    node, requested: Optional[str] = None, installed: Optional[list] = None
+):
     """설치 대상을 정한다.
 
     한 호스트에는 배포판 하나만 존재할 수 있다(모두 6443 과 /etc/rancher 를
-    공유한다). 그래서 고를 일이 생기는 건 '아무것도 없을 때' 뿐이고, 그때만
-    물어본다. 이미 있으면 그것을 그대로 따르므로 충돌이 발생할 수 없다.
+    공유한다). 고를 일이 생기는 건 '아무것도 없을 때' 뿐이다:
+    사람이 있으면 화살표로 묻고, 스크립트는 --distro 로 지정하며,
+    지정 없는 스크립트는 k3s 를 기본으로 쓰되 그 사실을 로그에 남긴다 —
+    조용히 내린 결정은 나중에 읽는 사람에게 미스터리가 된다.
     """
-    installed = _installed_on(node)
+    if installed is None:
+        installed = _installed_on(node)
 
     if len(installed) > 1:
         _fail(
@@ -448,37 +411,133 @@ def _distro_to_install(node):
         )
 
     if installed:
-        return _resolve_distro(installed[0])
+        existing = installed[0]
+        if requested and requested != existing:
+            _fail(
+                f"{existing} is already installed on this host",
+                [
+                    "Kubernetes distributions cannot share a host — "
+                    "they all bind port 6443.",
+                    "Remove the existing one first:",
+                    "",
+                    f"    ssherpa down {node.target.name}",
+                ],
+            )
+        return _resolve_distro(existing)
 
-    # 스크립트로 실행되면 물어볼 수 없으므로 가벼운 쪽을 쓴다.
+    if requested:
+        return _resolve_distro(requested)
+
     if not _interactive():
+        console.print()
+        console.print(
+            Padding(
+                "[dim]No terminal to ask which distribution — defaulting to k3s. "
+                "Pass --distro to choose.[/dim]",
+                (0, 0, 0, 2),
+            )
+        )
         return _resolve_distro("k3s")
 
     return _prompt_for_distro()
 
 
 def _load_target(name: str) -> Target:
-    try:
+    with _surface_errors():
         return get_target(name)
-    except InventoryError as exc:
-        _fail(str(exc))
+
+
+def _print_up_result(result, distro_name: str, target: Target) -> None:
+    """up 의 결과 요약과 다음 할 일 안내.
+
+    ~/.kube/config 병합 결과에 따라 kubectl 사용법이 셋으로 갈린다:
+    기본값이 됐으면 그냥 kubectl, 기존 기본값을 존중했으면 --context,
+    병합이 실패했으면 단독 파일 + 환경변수 폴백.
+    """
+    _say()
+    if result.already_installed:
+        _say(f"[dim]{distro_name} was already installed — left as is.[/dim]")
+    if result.certificate_refreshed:
+        _say(
+            "[yellow]The host address changed since install — the certificate "
+            "was refreshed to match.[/yellow]"
+        )
+    _say("[bold green]Cluster ready[/bold green]")
+    _say(f"[dim]kubeconfig: {result.kubeconfig}[/dim]")
+    _say()
+
+    if result.merge_error:
+        _say(f"[yellow]Could not update ~/.kube/config: {result.merge_error}[/yellow]")
+        _say("Use the standalone file instead:", indent=4)
+        kubectl = f'$env:KUBECONFIG="{result.kubeconfig}"; kubectl'
+    elif result.context_is_current:
+        _say(
+            f"[dim]Added to ~/.kube/config as context "
+            f"[/dim][bold]{result.context}[/bold][dim] (now the default).[/dim]"
+        )
+        kubectl = "kubectl"
+    else:
+        _say(
+            f"[dim]Added to ~/.kube/config as context "
+            f"[/dim][bold]{result.context}[/bold][dim] — your current context "
+            "was left untouched.[/dim]"
+        )
+        kubectl = f"kubectl --context {result.context}"
+
+    _say()
+    if result.api_reachable:
+        _say("Use it from any terminal:")
+        _say(f"[dim]{kubectl} get nodes[/dim]", indent=4)
+    else:
+        # 포트가 막힌 것은 흔한 정상 상황이다. 실패로 처리하지 않고 방법을 안내한다.
+        _say(f"[yellow]Port {cluster.API_PORT} is not reachable from here.[/yellow]")
+        _say()
+        _say("Open an SSH tunnel in another terminal:", indent=4)
+        _say(
+            f"[dim]ssh -L {cluster.API_PORT}:127.0.0.1:{cluster.API_PORT} "
+            f"{target.destination()}[/dim]",
+            indent=6,
+        )
+        _say()
+        _say("then point kubectl at the tunnel:", indent=4)
+        _say(
+            f"[dim]{kubectl} --server https://127.0.0.1:{cluster.API_PORT} get nodes[/dim]",
+            indent=6,
+        )
+        _say()
+        _say(
+            "[dim]Opening the port to the internet instead would expose the "
+            "cluster API — restrict it to your own address if you do.[/dim]",
+            indent=4,
+        )
+    _say()
 
 
 @app.command("up")
 def up(
     name: str = typer.Argument(..., help="Registered target name"),
+    distro: Optional[str] = typer.Option(
+        None,
+        "--distro",
+        help=f"Choose without prompting ({distro_mod.names()}) — for scripts",
+    ),
     assume_yes: bool = typer.Option(
         False, "--yes", "-y", help="Do not ask for confirmation"
     ),
 ) -> None:
     """Install Kubernetes on a target host.
 
-    Asks which distribution to install when the host is empty. If one is
-    already installed it is detected and left alone, so re-running is safe.
+    Asks which distribution to install when the host is empty (pass --distro
+    to skip the question, e.g. in scripts). If one is already installed it is
+    detected and left alone, so re-running is safe.
     """
     target = _load_target(name)
     node = cluster.nodes_for_host_mode(target)[0]
     already_installed = _installed_on(node)
+
+    # 충돌(--distro 가 설치본과 다름)은 재실행 안내보다 먼저 판정해야 한다 —
+    # "재설치는 안 한다"고 말해놓고 거부하면 앞뒤가 안 맞는다.
+    chosen = _distro_to_install(node, distro, installed=already_installed)
 
     if already_installed:
         console.print()
@@ -500,71 +559,16 @@ def up(
         if not _confirm("Continue?", assume_yes=assume_yes):
             raise typer.Exit(code=1)
 
-    chosen = _distro_to_install(node)
-
     console.print()
     console.print(
         Padding(f"Installing [bold]{chosen.name}[/bold] on [bold]{name}[/bold]", (0, 0, 0, 2))
     )
     console.print()
 
-    try:
+    with _surface_errors():
         result = cluster.up(node, chosen, StepReporter(console))
-    except SSHError as exc:
-        _fail(exc.message, exc.hints)
-    except ClusterError as exc:
-        _fail(exc.message, exc.hints)
 
-    console.print()
-    if result.already_installed:
-        console.print(
-            Padding(f"[dim]{chosen.name} was already installed — left as is.[/dim]", (0, 0, 0, 2))
-        )
-    console.print(Padding("[bold green]Cluster ready[/bold green]", (0, 0, 0, 2)))
-    console.print(Padding(f"[dim]kubeconfig: {result.kubeconfig}[/dim]", (0, 0, 0, 2)))
-    console.print()
-
-    if result.api_reachable:
-        console.print(Padding("Use it with:", (0, 0, 0, 2)))
-        console.print(
-            Padding(f"[dim]$env:KUBECONFIG=\"{result.kubeconfig}\"; kubectl get nodes[/dim]",
-                    (0, 0, 0, 4))
-        )
-    else:
-        # 포트가 막힌 것은 흔한 정상 상황이다. 실패로 처리하지 않고 방법을 안내한다.
-        console.print(
-            Padding(
-                f"[yellow]Port {cluster.API_PORT} is not reachable from here.[/yellow]",
-                (0, 0, 0, 2),
-            )
-        )
-        console.print()
-        console.print(Padding("Open an SSH tunnel in another terminal:", (0, 0, 0, 4)))
-        console.print(
-            Padding(
-                f"[dim]ssh -L {cluster.API_PORT}:127.0.0.1:{cluster.API_PORT} "
-                f"{target.user}@{target.host}[/dim]",
-                (0, 0, 0, 6),
-            )
-        )
-        console.print()
-        console.print(Padding("then point kubectl at the tunnel:", (0, 0, 0, 4)))
-        console.print(
-            Padding(
-                f"[dim]$env:KUBECONFIG=\"{result.kubeconfig}\"; "
-                f"kubectl --server https://127.0.0.1:{cluster.API_PORT} get nodes[/dim]",
-                (0, 0, 0, 6),
-            )
-        )
-        console.print()
-        console.print(
-            Padding(
-                "[dim]Opening the port to the internet instead would expose the "
-                "cluster API — restrict it to your own address if you do.[/dim]",
-                (0, 0, 0, 4),
-            )
-        )
-    console.print()
+    _print_up_result(result, chosen.name, target)
 
 
 @app.command("status")
@@ -576,10 +580,8 @@ def status(
     node = cluster.nodes_for_host_mode(target)[0]
     known = list(distro_mod.DISTROS.values())
 
-    try:
+    with _surface_errors():
         host = cluster.status(node, known)
-    except SSHError as exc:
-        _fail(exc.message, exc.hints)
 
     table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
     table.add_column(no_wrap=True, style="bold")
@@ -669,12 +671,8 @@ def down(
 
     for distro_name in installed:
         chosen = _resolve_distro(distro_name)
-        try:
+        with _surface_errors():
             cluster.down(node, chosen, StepReporter(console))
-        except SSHError as exc:
-            _fail(exc.message, exc.hints)
-        except ClusterError as exc:
-            _fail(exc.message, exc.hints)
 
     console.print()
     console.print(Padding("[bold green]Removed[/bold green]", (0, 0, 0, 2)))
@@ -698,10 +696,13 @@ def ssh_cmd(
     if shutil.which("ssh") is None:
         _fail("ssh client not found")
 
-    argv = ["ssh", "-p", str(target.port)]
+    # 명시된 것만 넘긴다 — 나머지는 ~/.ssh/config 가 정한다 (run() 과 동일 원칙)
+    argv = ["ssh"]
+    if target.port:
+        argv += ["-p", str(target.port)]
     if target.key:
         argv += ["-i", os.path.expanduser(target.key)]
-    argv += [f"{target.user}@{target.host}", *ctx.args]
+    argv += [target.destination(), *ctx.args]
 
     # 대화형 세션이므로 출력을 가로채지 않고 그대로 넘긴다.
     raise typer.Exit(code=subprocess.call(argv))
