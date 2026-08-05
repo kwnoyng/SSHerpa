@@ -854,6 +854,20 @@ def down(
     console.print(Padding("[dim]Workloads and cluster state are lost.[/dim]", (0, 0, 0, 2)))
     console.print()
 
+    # 물어볼 자리가 없다고 해서 승낙은 아니다. up 은 되돌릴 수 있으니 조용히
+    # 진행해도 되지만, 여기서 잘못 진행하면 클러스터가 돌아오지 않는다 —
+    # 파괴는 명시적으로 요청받았을 때만 한다.
+    if not assume_yes and not _interactive():
+        _fail(
+            "Refusing to destroy a cluster without confirmation",
+            [
+                "There is no terminal to ask on, and this cannot be undone.",
+                "Say so explicitly if that is what you want:",
+                "",
+                f"    ssherpa down {name} --yes",
+            ],
+        )
+
     if not _confirm("Continue?", assume_yes=assume_yes):
         raise typer.Exit(code=1)
 
