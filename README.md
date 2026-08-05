@@ -97,10 +97,12 @@ then each step reports as it completes:
 ```
   Installing k3s on lab-01
 
-    ✓ preflight                1.6s
-    ✓ install k3s             18.8s
-    ✓ wait for node            1.1s
-    ✓ fetch kubeconfig         0.8s
+    ✓ preflight                1.4s
+    ✓ configure tls-san        0.7s
+    ✓ install k3s             17.5s
+    ✓ wait for node            1.2s
+    ✓ verify certificate       0.8s
+    ✓ fetch kubeconfig         0.7s
     ✓ verify api access        5.0s
 
   Cluster ready
@@ -119,8 +121,13 @@ Details worth knowing:
   2 GB host fails in seconds with the actual reason (not enough memory) and a
   suggestion, instead of timing out after five minutes with the control plane
   half-up.
-- The install passes `--tls-san <your-address>` so the API server certificate
-  is valid for the address you connect to, not just the host's internal IP.
+- The connect address is written into the distro's config (`tls-san`) before
+  install, so the API server certificate is valid for the address you connect
+  to — not just the host's internal IP.
+- **An address change heals itself.** Cloud hosts lose their external IP on
+  stop/start unless one is reserved. Re-run `up` after updating the target:
+  it detects that the certificate no longer covers the new address, refreshes
+  it in place, and re-fetches the kubeconfig. No reinstall, cluster data kept.
 
 ### 3. Use the cluster
 
