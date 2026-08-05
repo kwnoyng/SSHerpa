@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.padding import Padding
 from rich.table import Table
 
-from . import __version__, cluster, facts, support
+from . import __version__, cluster, facts, probe, support
 from . import distro as distro_mod
 from .cluster import ClusterError
 from .inventory import (
@@ -118,85 +118,6 @@ class StepReporter:
         self.console.print(
             Padding(f"[green]✓[/green] {label:<22}[dim]{elapsed:6.1f}s[/dim]", (0, 0, 0, 4))
         )
-
-
-# --------------------------------------------------------------------------
-# 원격 검사
-# --------------------------------------------------------------------------
-
-# 한 번의 접속으로 uid / sudo / os-release 를 모두 가져온다.
-PROBE = (
-    'echo "SSHERPA_UID=$(id -u)"; '
-    'echo "SSHERPA_SUDO"; '
-    "sudo -n true 2>&1; "
-    'echo "SSHERPA_SUDO_RC=$?"; '
-    'echo "SSHERPA_OSRELEASE"; '
-    "cat /etc/os-release 2>/dev/null"
-)
-
-
-def _split_probe(stdout: str) -> tuple[str, str, str]:
-    """PROBE 출력을 (uid, sudo구간, os-release) 로 나눈다."""
-    uid = ""
-    sudo_block: list[str] = []
-    osrelease: list[str] = []
-    section = "head"
-
-    for line in stdout.splitlines():
-        if line.startswith("SSHERPA_UID="):
-            uid = line.split("=", 1)[1].strip()
-        elif line == "SSHERPA_SUDO":
-            section = "sudo"
-        elif line == "SSHERPA_OSRELEASE":
-            section = "os"
-        elif section == "sudo":
-            sudo_block.append(line)
-        elif section == "os":
-            osrelease.append(line)
-
-    return uid, "\n".join(sudo_block), "\n".join(osrelease)
-
-
-def _judge_sudo(uid: str, sudo_block: str) -> tuple[bool, str, list[str]]:
-    """(통과여부, 표시문구, 힌트) 를 돌려준다."""
-    if uid == "0":
-        return True, "root account", []
-
-    rc = None
-    message_lines = []
-    for line in sudo_block.splitlines():
-        if line.startswith("SSHERPA_SUDO_RC="):
-            rc = line.split("=", 1)[1].strip()
-        else:
-            message_lines.append(line)
-    message = "\n".join(message_lines).lower()
-
-    if rc == "0":
-        return True, "NOPASSWD", []
-
-    if "command not found" in message or rc == "127":
-        return False, "sudo is not installed", [
-            "Install sudo on the target host, or use the root account",
-        ]
-
-    if "password is required" in message:
-        return False, "password required", []
-
-    if "not allowed" in message or "not in the sudoers" in message:
-        return False, "not in sudoers", []
-
-    return False, "sudo is unavailable", (
-        [line for line in message_lines if line.strip()][:2]
-    )
-
-
-def _sudo_fix_hint(user: str) -> list[str]:
-    return [
-        f"SSHerpa needs passwordless sudo for '{user}'.",
-        "Run this on the target host:",
-        "",
-        f"    echo '{user} ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/ssherpa",
-    ]
 
 
 # --------------------------------------------------------------------------
@@ -314,20 +235,20 @@ def check(
 
     # --- 1. SSH 연결 -------------------------------------------------------
     try:
-        result = run(target, PROBE)
+        result = run(target, probe.PROBE)
     except SSHError as exc:
         _print_checks([("SSH connection", False, exc.message)])
         _fail("Check the following:" if exc.hints else exc.message, exc.hints)
 
     rows: list[tuple[str, bool, str]] = [("SSH connection", True, target.endpoint())]
-    uid, sudo_block, osrelease_text = _split_probe(result.stdout)
+    uid, sudo_block, osrelease_text = probe.split_probe(result.stdout)
 
     # --- 2. sudo 권한 ------------------------------------------------------
-    sudo_ok, sudo_detail, sudo_hints = _judge_sudo(uid, sudo_block)
+    sudo_ok, sudo_detail, sudo_hints = probe.judge_sudo(uid, sudo_block)
     rows.append(("sudo access", sudo_ok, sudo_detail))
     if not sudo_ok:
         _print_checks(rows)
-        _fail("Passwordless sudo is required", sudo_hints or _sudo_fix_hint(target.user))
+        _fail("Passwordless sudo is required", sudo_hints or probe.sudo_fix_hint(target.user))
 
     # --- 3. OS 감지 --------------------------------------------------------
     if not osrelease_text.strip():
