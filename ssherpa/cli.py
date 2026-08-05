@@ -16,6 +16,7 @@ from rich.table import Table
 
 from . import __version__, cluster, facts, probe, support
 from . import distro as distro_mod
+from . import doctor as doctor_mod
 from .cluster import ClusterError
 from .inventory import (
     InventoryError,
@@ -228,6 +229,73 @@ def target_remove(
     console.print()
     console.print(Padding(f"[green]✓[/green] [bold]{name}[/bold] removed", (0, 0, 0, 2)))
     console.print()
+
+
+# --------------------------------------------------------------------------
+# doctor 명령
+# --------------------------------------------------------------------------
+
+_DOCTOR_MARKS = {"ok": "[green]✓[/green]", "fail": "[red]✗[/red]", "info": "[dim]—[/dim]"}
+
+
+@app.command("doctor")
+def doctor(
+    name: Optional[str] = typer.Argument(None, help="Registered target name"),
+    host: Optional[str] = typer.Option(
+        None, "--host", help="IP, hostname, or ~/.ssh/config alias (one-off)"
+    ),
+    user: Optional[str] = typer.Option(
+        None, "--user", help="SSH username (omit to let ~/.ssh/config decide)"
+    ),
+    key: Optional[str] = typer.Option(None, "--key", help="Path to SSH private key"),
+    port: Optional[int] = typer.Option(
+        None, "--port", help="SSH port (omit to let ~/.ssh/config decide)"
+    ),
+) -> None:
+    """Diagnose whether a host can run VM-backed clusters.
+
+    `check` asks "can SSHerpa work with this host at all"; doctor asks
+    "can this host create VMs". A host that fails here can still run
+    host-mode clusters — the verdict says which way to go.
+    """
+    if name:
+        if host or user:
+            _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
+        with _surface_errors():
+            target = get_target(name)
+    else:
+        if not host:
+            _fail("A target name or --host is required.", USAGE_HINTS)
+        target = Target(name=None, host=host, user=user, port=port, key=key)
+
+    with _surface_errors():
+        result = run(target, doctor_mod.DOCTOR_PROBE, timeout=60)
+
+    facts_ = doctor_mod.parse_probe(result.stdout)
+    diagnosis = doctor_mod.diagnose(facts_)
+
+    table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
+    table.add_column(no_wrap=True)
+    table.add_column(no_wrap=True, justify="center")
+    table.add_column(overflow="fold")
+    for label, state, detail in diagnosis.rows:
+        table.add_row(label, _DOCTOR_MARKS[state], detail)
+
+    _say()
+    _say(f"[dim]Host type:[/dim]  {diagnosis.host_type}")
+    _say()
+    console.print(Padding(table, (0, 0, 0, 2)))
+    _say()
+
+    label = target.name or target.host
+    if diagnosis.capable:
+        _say(f"[bold green]{label} can run VM-backed clusters[/bold green]")
+        _say()
+        return
+
+    # 처방 속 자리표시자를 실제 타겟 이름으로 채운다
+    hints = [hint.replace("<target>", label) for hint in diagnosis.hints]
+    _fail(diagnosis.failure, hints)
 
 
 # --------------------------------------------------------------------------
