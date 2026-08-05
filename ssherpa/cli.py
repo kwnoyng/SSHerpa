@@ -647,7 +647,12 @@ def _up_vm(name: str, target: Target, requested: Optional[str]) -> None:
         info = vm_mod.create(target, reporter=reporter)
         vm_mod.expose_api(target, info.ip, reporter)
         vm_node = cluster.Node(
-            name=f"{name}-vm", target=vm_mod.vm_target(target, info)
+            name=f"{name}-vm",
+            target=vm_mod.vm_target(target, info),
+            # 오류 힌트가 안내할 이름은 VM 의 합성 이름이 아니라 사용자가
+            # 등록한 타겟이다 — 그리고 그 안으로 들어가려면 --vm 이 필요하다.
+            cli_name=name,
+            in_vm=True,
         )
         # 인증서와 kubeconfig 에는 밖에서 닿는 주소(호스트)를 넣는다 —
         # VM 의 NAT 주소는 내 PC 의 kubectl 이 갈 수 없는 주소다.
