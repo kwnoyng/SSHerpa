@@ -127,10 +127,16 @@ class StepReporter:
 @target_app.command("add")
 def target_add(
     name: str = typer.Argument(..., help="Target name (e.g. lab-01)"),
-    host: str = typer.Option(..., "--host", help="IP address or hostname"),
-    user: str = typer.Option(..., "--user", help="SSH username"),
+    host: str = typer.Option(
+        ..., "--host", help="IP, hostname, or a Host alias from ~/.ssh/config"
+    ),
+    user: Optional[str] = typer.Option(
+        None, "--user", help="SSH username (omit to let ~/.ssh/config decide)"
+    ),
     key: Optional[str] = typer.Option(None, "--key", help="Path to SSH private key"),
-    port: int = typer.Option(22, "--port", help="SSH port"),
+    port: Optional[int] = typer.Option(
+        None, "--port", help="SSH port (omit to let ~/.ssh/config decide; ssh defaults to 22)"
+    ),
 ) -> None:
     """Register a target in the inventory. Does not connect."""
     try:
@@ -179,7 +185,13 @@ def target_list() -> None:
     table.add_column("PORT", justify="right")
 
     for target in targets:
-        table.add_row(target.name, target.host, target.user, str(target.port))
+        # 비워둔 항목은 접속 시 ~/.ssh/config 가 정한다
+        table.add_row(
+            target.name,
+            target.host,
+            target.user or "[dim]—[/dim]",
+            str(target.port) if target.port else "[dim]—[/dim]",
+        )
 
     console.print()
     console.print(Padding(table, (0, 0, 0, 2)))
@@ -208,10 +220,16 @@ def target_remove(
 @app.command("check")
 def check(
     name: Optional[str] = typer.Argument(None, help="Registered target name"),
-    host: Optional[str] = typer.Option(None, "--host", help="IP or hostname (one-off)"),
-    user: Optional[str] = typer.Option(None, "--user", help="SSH username"),
+    host: Optional[str] = typer.Option(
+        None, "--host", help="IP, hostname, or ~/.ssh/config alias (one-off)"
+    ),
+    user: Optional[str] = typer.Option(
+        None, "--user", help="SSH username (omit to let ~/.ssh/config decide)"
+    ),
     key: Optional[str] = typer.Option(None, "--key", help="Path to SSH private key"),
-    port: int = typer.Option(22, "--port", help="SSH port"),
+    port: Optional[int] = typer.Option(
+        None, "--port", help="SSH port (omit to let ~/.ssh/config decide)"
+    ),
 ) -> None:
     """Check whether a host is ready for SSHerpa.
 
@@ -227,8 +245,8 @@ def check(
         except InventoryError as exc:
             _fail(str(exc))
     else:
-        if not host or not user:
-            _fail("A target name, or both --host and --user, are required.", USAGE_HINTS)
+        if not host:
+            _fail("A target name or --host is required.", USAGE_HINTS)
         target = Target(name=None, host=host, user=user, port=port, key=key)
 
     label = target.name or target.host
@@ -240,15 +258,21 @@ def check(
         _print_checks([("SSH connection", False, exc.message)])
         _fail("Check the following:" if exc.hints else exc.message, exc.hints)
 
-    rows: list[tuple[str, bool, str]] = [("SSH connection", True, target.endpoint())]
-    uid, sudo_block, osrelease_text = probe.split_probe(result.stdout)
+    uid, remote_user, sudo_block, osrelease_text = probe.split_probe(result.stdout)
+
+    # --user 없이 config 의 User 로 접속한 경우, 실제 계정명은 서버가 알려준다
+    shown = target.endpoint()
+    if not target.user and remote_user:
+        shown = f"{remote_user}@{target.host}" + (f":{target.port}" if target.port else "")
+    rows: list[tuple[str, bool, str]] = [("SSH connection", True, shown)]
 
     # --- 2. sudo 권한 ------------------------------------------------------
     sudo_ok, sudo_detail, sudo_hints = probe.judge_sudo(uid, sudo_block)
     rows.append(("sudo access", sudo_ok, sudo_detail))
     if not sudo_ok:
         _print_checks(rows)
-        _fail("Passwordless sudo is required", sudo_hints or probe.sudo_fix_hint(target.user))
+        fix_user = remote_user or target.user or "<user>"
+        _fail("Passwordless sudo is required", sudo_hints or probe.sudo_fix_hint(fix_user))
 
     # --- 3. OS 감지 --------------------------------------------------------
     if not osrelease_text.strip():
@@ -500,7 +524,7 @@ def up(
         console.print(
             Padding(
                 f"[dim]ssh -L {cluster.API_PORT}:127.0.0.1:{cluster.API_PORT} "
-                f"{target.user}@{target.host}[/dim]",
+                f"{target.destination()}[/dim]",
                 (0, 0, 0, 6),
             )
         )
@@ -655,10 +679,13 @@ def ssh_cmd(
     if shutil.which("ssh") is None:
         _fail("ssh client not found")
 
-    argv = ["ssh", "-p", str(target.port)]
+    # 명시된 것만 넘긴다 — 나머지는 ~/.ssh/config 가 정한다 (run() 과 동일 원칙)
+    argv = ["ssh"]
+    if target.port:
+        argv += ["-p", str(target.port)]
     if target.key:
         argv += ["-i", os.path.expanduser(target.key)]
-    argv += [f"{target.user}@{target.host}", *ctx.args]
+    argv += [target.destination(), *ctx.args]
 
     # 대화형 세션이므로 출력을 가로채지 않고 그대로 넘긴다.
     raise typer.Exit(code=subprocess.call(argv))

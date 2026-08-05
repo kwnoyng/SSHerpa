@@ -61,11 +61,12 @@ def _save_raw(data: dict) -> None:
 
 
 def _to_target(name: str, vars_: dict) -> Target:
+    port = vars_.get("ansible_port")
     return Target(
         name=name,
         host=vars_.get("ansible_host", ""),
-        user=vars_.get("ansible_user", ""),
-        port=int(vars_.get("ansible_port", 22)),
+        user=vars_.get("ansible_user"),
+        port=int(port) if port is not None else None,
         key=vars_.get("ansible_ssh_private_key_file"),
     )
 
@@ -88,8 +89,8 @@ def get_target(name: str) -> Target:
 def add_target(
     name: str,
     host: str,
-    user: str,
-    port: int = 22,
+    user: Optional[str] = None,
+    port: Optional[int] = None,
     key: Optional[str] = None,
 ) -> Target:
     if not NAME_PATTERN.match(name):
@@ -106,7 +107,12 @@ def add_target(
             f"Remove it first:  ssherpa target remove {name}"
         )
 
-    vars_: dict[str, object] = {"ansible_host": host, "ansible_user": user, "ansible_port": port}
+    # 지정한 값만 기록한다. 안 적은 항목은 접속할 때 ~/.ssh/config 가 정한다.
+    vars_: dict[str, object] = {"ansible_host": host}
+    if user:
+        vars_["ansible_user"] = user
+    if port:
+        vars_["ansible_port"] = port
     if key:
         vars_["ansible_ssh_private_key_file"] = key
 

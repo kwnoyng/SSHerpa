@@ -9,10 +9,11 @@ from ssherpa.probe import judge_sudo, split_probe
 OS_RELEASE = 'ID="rocky"\nVERSION_ID="9.8"\n'
 
 
-def probe(uid="1000", sudo_lines="", os_release=OS_RELEASE):
+def probe(uid="1000", user="admin", sudo_lines="", os_release=OS_RELEASE):
     """실제 PROBE 가 만들어내는 형태의 stdout 을 조립한다."""
     return (
         f"SSHERPA_UID={uid}\n"
+        f"SSHERPA_USER={user}\n"
         "SSHERPA_SUDO\n"
         f"{sudo_lines}"
         "SSHERPA_OSRELEASE\n"
@@ -21,25 +22,32 @@ def probe(uid="1000", sudo_lines="", os_release=OS_RELEASE):
 
 
 class TestSplitProbe:
-    def test_splits_three_sections(self):
-        uid, sudo, osr = split_probe(probe(sudo_lines="SSHERPA_SUDO_RC=0\n"))
+    def test_splits_four_sections(self):
+        uid, user, sudo, osr = split_probe(probe(sudo_lines="SSHERPA_SUDO_RC=0\n"))
         assert uid == "1000"
+        assert user == "admin"
         assert "SSHERPA_SUDO_RC=0" in sudo
         assert 'ID="rocky"' in osr
 
+    def test_remote_username_is_captured(self):
+        # --user 없이 config 의 User 로 접속하면, 실제 계정명은 서버만 안다.
+        # sudoers 안내문에 정확한 이름을 넣으려면 이 값이 필요하다.
+        _, user, _, _ = split_probe(probe(user="deploy"))
+        assert user == "deploy"
+
     def test_os_release_section_is_clean(self):
         # sudo 구간의 문구가 os-release 로 새면 OS 감지가 깨진다
-        _, _, osr = split_probe(
+        _, _, _, osr = split_probe(
             probe(sudo_lines="sudo: a password is required\nSSHERPA_SUDO_RC=1\n")
         )
         assert "password" not in osr
 
     def test_missing_os_release(self):
-        _, _, osr = split_probe(probe(os_release=""))
+        _, _, _, osr = split_probe(probe(os_release=""))
         assert osr == ""
 
     def test_garbage_input_does_not_crash(self):
-        assert split_probe("unexpected output") == ("", "", "")
+        assert split_probe("unexpected output") == ("", "", "", "")
 
 
 class TestJudgeSudo:

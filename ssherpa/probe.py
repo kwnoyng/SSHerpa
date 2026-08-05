@@ -5,10 +5,15 @@ check 명령이 SSH 접속 한 번으로 uid / sudo / os-release 를 모두 가�
 cli.py 가 아니라 여기 산다.
 """
 
-# 한 번의 접속으로 uid / sudo / os-release 를 모두 가져온다.
+# 한 번의 접속으로 uid / 사용자명 / sudo / os-release 를 모두 가져온다.
 # 검사마다 접속하면 핸드셰이크가 반복돼 느려진다.
+#
+# 사용자명을 원격에서 직접 읽는 이유: --user 없이 ~/.ssh/config 의 User 로
+# 접속한 경우, 우리는 어떤 계정으로 들어갔는지 모른다. sudoers 안내문에
+# 정확한 이름을 넣으려면 서버에게 물어보는 수밖에 없다.
 PROBE = (
     'echo "SSHERPA_UID=$(id -u)"; '
+    'echo "SSHERPA_USER=$(id -un)"; '
     'echo "SSHERPA_SUDO"; '
     "sudo -n true 2>&1; "
     'echo "SSHERPA_SUDO_RC=$?"; '
@@ -17,9 +22,10 @@ PROBE = (
 )
 
 
-def split_probe(stdout: str) -> tuple[str, str, str]:
-    """PROBE 출력을 (uid, sudo구간, os-release) 로 나눈다."""
+def split_probe(stdout: str) -> tuple[str, str, str, str]:
+    """PROBE 출력을 (uid, 사용자명, sudo구간, os-release) 로 나눈다."""
     uid = ""
+    user = ""
     sudo_block: list[str] = []
     osrelease: list[str] = []
     section = "head"
@@ -27,6 +33,8 @@ def split_probe(stdout: str) -> tuple[str, str, str]:
     for line in stdout.splitlines():
         if line.startswith("SSHERPA_UID="):
             uid = line.split("=", 1)[1].strip()
+        elif line.startswith("SSHERPA_USER="):
+            user = line.split("=", 1)[1].strip()
         elif line == "SSHERPA_SUDO":
             section = "sudo"
         elif line == "SSHERPA_OSRELEASE":
@@ -36,7 +44,7 @@ def split_probe(stdout: str) -> tuple[str, str, str]:
         elif section == "os":
             osrelease.append(line)
 
-    return uid, "\n".join(sudo_block), "\n".join(osrelease)
+    return uid, user, "\n".join(sudo_block), "\n".join(osrelease)
 
 
 def judge_sudo(uid: str, sudo_block: str) -> tuple[bool, str, list[str]]:

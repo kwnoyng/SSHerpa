@@ -31,9 +31,21 @@ class TestAdd:
         assert (target.host, target.user, target.port) == ("10.0.0.1", "admin", 2222)
         assert target.key == "~/.ssh/k"
 
-    def test_port_defaults_to_22(self):
+    def test_unspecified_port_stays_unspecified(self, temp_inventory):
+        # 우리가 22 를 채워 기록하면 접속 때 -p 22 가 강제되어
+        # ~/.ssh/config 의 Port 설정을 덮어써 버린다
         add_target("lab-01", host="10.0.0.1", user="admin")
-        assert get_target("lab-01").port == 22
+        assert get_target("lab-01").port is None
+        data = yaml.safe_load(temp_inventory.read_text())
+        assert "ansible_port" not in data["all"]["hosts"]["lab-01"]
+
+    def test_alias_only_registration(self, temp_inventory):
+        # ~/.ssh/config 별칭만으로 등록 — user 도 port 도 없다
+        add_target("mylab", host="lab")
+        target = get_target("mylab")
+        assert (target.host, target.user, target.port) == ("lab", None, None)
+        data = yaml.safe_load(temp_inventory.read_text())
+        assert data["all"]["hosts"]["mylab"] == {"ansible_host": "lab"}
 
     def test_key_is_omitted_when_not_given(self, temp_inventory):
         add_target("lab-01", host="10.0.0.1", user="admin")

@@ -167,7 +167,44 @@ class TestBuildCommand:
         # -i 를 안 넘겨야 ssh 가 기본 키를 스스로 찾는다
         assert "-i" not in ssh._build_command(TARGET, "true")
 
-    def test_port_and_destination(self):
-        argv = ssh._build_command(TARGET, "whoami")
+    def test_explicit_port_and_user_are_passed(self):
+        explicit = Target(name=None, host="192.168.0.51", user="admin", port=2222)
+        argv = ssh._build_command(explicit, "whoami")
         assert argv[-2:] == ["admin@192.168.0.51", "whoami"]
-        assert "22" in argv
+        assert "-p" in argv and "2222" in argv
+
+
+class TestSshConfigRespect:
+    """명령줄 옵션은 ~/.ssh/config 를 이긴다. 그래서 사용자가 지정하지 않은
+    값을 우리가 기본값으로 채워 넘기면, config 의 Port 2222 를 -p 22 로
+    덮어써서 'ssh 로는 되는데 SSHerpa 로는 안 되는' 상황을 만든다."""
+
+    ALIAS = Target(name="mylab", host="lab")  # user/port/key 전부 미지정
+
+    def test_no_port_flag_when_not_given(self):
+        argv = ssh._build_command(self.ALIAS, "true")
+        assert "-p" not in argv
+
+    def test_no_user_prefix_when_not_given(self):
+        argv = ssh._build_command(self.ALIAS, "true")
+        assert argv[-2] == "lab"  # user@ 없이 — config 의 User 가 정한다
+
+    def test_destination_helper(self):
+        assert self.ALIAS.destination() == "lab"
+        assert TARGET.destination() == "admin@192.168.0.51"
+
+    def test_endpoint_display_without_port(self):
+        assert self.ALIAS.endpoint() == "lab"
+
+    def test_refused_error_does_not_invent_a_port(self):
+        # 포트를 모르는데 (host:22) 라고 표시하면 config 사용자를 오도한다
+        err = ssh._classify(
+            "ssh: connect to host lab port 2222: Connection refused", self.ALIAS
+        )
+        assert "(lab)" in err.message
+        assert any("~/.ssh/config" in hint for hint in err.hints)
+
+    def test_auth_failure_without_user_does_not_show_none(self):
+        err = ssh._classify("x: Permission denied (publickey).", self.ALIAS)
+        assert "None" not in err.message
+        assert all("None" not in hint for hint in err.hints)
