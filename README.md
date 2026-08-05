@@ -285,7 +285,14 @@ host can only run one distribution. It asks for confirmation (destroying a
 cluster is not undoable), stops everything, runs the uninstaller, verifies
 nothing was left behind, and cleans up locally too: the standalone kubeconfig
 is deleted and the `ssherpa-<target>` entries are removed from
-`~/.kube/config`. `--yes` skips the prompt for scripts.
+`~/.kube/config`.
+
+**Scripts must pass `--yes`.** Where there is no terminal to ask on — CI, a
+pipe, a redirect — SSHerpa refuses to destroy anything rather than read
+"could not ask" as consent, and exits 1 saying so. `up` is the opposite:
+re-running it changes nothing that cannot be changed back, so it goes ahead
+unattended. A host with nothing on it needs no `--yes` either; `down` says so
+and exits 0, which keeps clean-up scripts simple.
 
 ### 5. Jump onto the host — or into the VM
 
