@@ -107,6 +107,57 @@ class TestPromptSafety:
         assert cli._confirm("Continue?", assume_yes=False) is True
 
 
+class TestStatusSurvivesALostConnection:
+    """호스트에 묻는 일이 출력 도중에 남아 있으면 그 실패는 보호 밖이다.
+
+    VM 이 있는 호스트의 status 는 표를 그린 뒤 VM 상태를 한 번 더 물었다.
+    그 사이 연결이 끊기면 이 도구가 공들인 '사람이 읽는 오류' 대신
+    스택트레이스가 나갔다.
+    """
+
+    def _wire(self, monkeypatch, vm_state):
+        from ssherpa import cli
+        from ssherpa.cluster import DistroStatus, HostStatus
+        from ssherpa.ssh import Target
+
+        target = Target(name="lab-01", host="10.0.0.1")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        monkeypatch.setattr(
+            cli.cluster,
+            "status",
+            lambda *_a, **_k: HostStatus(
+                distros=[DistroStatus("k3s", installed=False, service_state="")]
+            ),
+        )
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: ["ssherpa-node-1"])
+        monkeypatch.setattr(cli.vm_mod, "vm_state", vm_state)
+
+    def test_lost_connection_becomes_a_readable_failure(self, monkeypatch):
+        import typer
+
+        from ssherpa import cli
+        from ssherpa.ssh import SSHError
+
+        def drop(*_a, **_k):
+            raise SSHError("connection refused (10.0.0.1)", ["Check that sshd is running"])
+
+        self._wire(monkeypatch, drop)
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit) as caught:
+            cli.status("lab-01")
+        assert caught.value.exit_code == 1
+        assert "connection refused" in captured.get()
+
+    def test_healthy_host_still_reports_the_vm(self, monkeypatch):
+        from ssherpa import cli
+
+        self._wire(monkeypatch, lambda *_a, **_k: "running")
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "ssherpa-node-1" in out
+        assert "running" in out
+
+
 class TestDistroSelection:
     """빈 호스트에서만 고를 일이 생긴다: 사람은 화살표, 스크립트는 --distro,
     지정 없는 스크립트는 k3s 기본 + 그 사실을 로그에 남긴다."""

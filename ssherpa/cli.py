@@ -753,9 +753,11 @@ def status(
     node = cluster.nodes_for_host_mode(target)[0]
     known = list(distro_mod.DISTROS.values())
 
+    # 호스트에 묻는 일은 전부 여기서 끝낸다. 출력 도중에 한 번 더 물으면
+    # 그때의 연결 실패는 이 블록 밖이라, 사람 말 대신 스택트레이스가 나간다.
     with _surface_errors():
         host = cluster.status(node, known)
-        vms = vm_mod.list_vms(target)
+        vms = [(vm, vm_mod.vm_state(target, vm)) for vm in vm_mod.list_vms(target)]
 
     table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
     table.add_column(no_wrap=True, style="bold")
@@ -775,8 +777,7 @@ def status(
     console.print(Padding(table, (0, 0, 0, 2)))
     console.print()
 
-    for vm_name in vms:
-        state = vm_mod.vm_state(target, vm_name)
+    for vm_name, state in vms:
         colour = "green" if state == "running" else "yellow"
         console.print(
             Padding(
@@ -852,6 +853,7 @@ def down(
     )
     console.print(Padding("[dim]Workloads and cluster state are lost.[/dim]", (0, 0, 0, 2)))
     console.print()
+
     if not _confirm("Continue?", assume_yes=assume_yes):
         raise typer.Exit(code=1)
 
