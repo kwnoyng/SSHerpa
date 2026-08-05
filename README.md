@@ -5,9 +5,10 @@
 
 Build Kubernetes labs on a single on-premises server, over nothing but SSH.
 
-> **v0.2** — register a host, check that it is ready, and stand up a
-> single-node Kubernetes cluster (k3s or RKE2) directly on it. VM-based
-> multi-node labs with snapshot/rewind come later.
+> **v0.3** — register a host, check that it is ready, and stand up a
+> single-node Kubernetes cluster (k3s or RKE2) directly on it, wired into
+> your `~/.kube/config`. VM-based multi-node labs with snapshot/rewind
+> come later.
 
 ## Requirements
 
@@ -77,9 +78,17 @@ composes with scripts. When something is wrong, it says what to do about it:
         echo 'admin ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/ssherpa
 ```
 
-`--key` and `--port` are optional: the port defaults to `22`, and without a
-key `ssh` looks for its usual defaults (`~/.ssh/id_ed25519`, `id_ecdsa`,
-`id_rsa`).
+Everything except `--host` is optional, and **whatever you leave out is
+resolved by `ssh` itself** — default keys (`~/.ssh/id_ed25519` …), and any
+`User`, `Port`, `IdentityFile`, or `ProxyJump` from your `~/.ssh/config`.
+SSHerpa never invents values it wasn't given, so a config entry like this
+works as-is, bastion hop included:
+
+```bash
+# with a `Host lab` block in ~/.ssh/config:
+ssherpa target add lab-01 --host lab
+ssherpa check lab-01
+```
 
 ### 2. Bring up a cluster
 
@@ -106,10 +115,13 @@ then each step reports as it completes:
     ✓ wait for node            1.2s
     ✓ verify certificate       0.8s
     ✓ fetch kubeconfig         0.7s
+    ✓ update ~/.kube/config    0.0s
     ✓ verify api access        5.0s
 
   Cluster ready
   kubeconfig: ~/.ssherpa/kubeconfig/lab-01.yaml
+
+  Added to ~/.kube/config as context ssherpa-lab-01 (now the default).
 ```
 
 Details worth knowing:
@@ -120,6 +132,10 @@ Details worth knowing:
 - **Re-running is safe.** If the host already has a cluster, `up` asks for
   confirmation, then skips the install and just refreshes the kubeconfig.
   Useful when a previous run was interrupted.
+- **Scripts pass `--distro`.** Without a terminal there is no prompt: an
+  explicit `--distro k3s|rke2` is used as given, and an unspecified run
+  defaults to k3s — saying so in the output, since silent decisions make
+  logs a mystery.
 - **Preflight catches real blockers early.** For example, installing RKE2 on a
   2 GB host fails in seconds with the actual reason (not enough memory) and a
   suggestion, instead of timing out after five minutes with the control plane
@@ -134,12 +150,26 @@ Details worth knowing:
 
 ### 3. Use the cluster
 
-The fetched kubeconfig already points at your host's address:
+`up` merges the cluster's credentials into `~/.kube/config` — the file
+kubectl reads by default — so **kubectl works from any terminal with no
+setup**:
 
 ```bash
-export KUBECONFIG=~/.ssherpa/kubeconfig/lab-01.yaml    # PowerShell: $env:KUBECONFIG="..."
 kubectl get nodes
 ```
+
+The entry is a context named `ssherpa-<target>`. If your kubeconfig already
+had clusters in it, your current context is left untouched (stealing the
+default from someone working against a production cluster is not our place) —
+address ours by name instead:
+
+```bash
+kubectl --context ssherpa-lab-01 get nodes
+```
+
+`down` removes exactly these entries again. A standalone copy also lives at
+`~/.ssherpa/kubeconfig/<target>.yaml` for anything that wants an isolated
+file.
 
 If port 6443 is not reachable (a cloud firewall, for instance), `up` says so
 and shows the safe alternative — an SSH tunnel:
@@ -174,8 +204,9 @@ ssherpa down lab-01
 `down` detects whatever is installed — there is nothing to choose, since a
 host can only run one distribution. It asks for confirmation (destroying a
 cluster is not undoable), stops everything, runs the uninstaller, verifies
-nothing was left behind, and deletes the local kubeconfig. `--yes` skips the
-prompt for scripts.
+nothing was left behind, and cleans up locally too: the standalone kubeconfig
+is deleted and the `ssherpa-<target>` entries are removed from
+`~/.kube/config`. `--yes` skips the prompt for scripts.
 
 ### 5. Jump onto the host
 
@@ -190,11 +221,11 @@ details. Extra arguments are passed straight to `ssh`.
 
 | Command | Connects over SSH |
 |---|---|
-| `ssherpa target add <NAME> --host <IP> --user <USER> [--key <PATH>] [--port <N>]` | no |
+| `ssherpa target add <NAME> --host <IP\|alias> [--user <USER>] [--key <PATH>] [--port <N>]` | no |
 | `ssherpa target list` | no |
 | `ssherpa target remove <NAME>` | no |
-| `ssherpa check <NAME>` (or `--host/--user` for one-off) | yes |
-| `ssherpa up <NAME> [--yes]` | yes |
+| `ssherpa check <NAME>` (or `--host` for one-off) | yes |
+| `ssherpa up <NAME> [--distro k3s\|rke2] [--yes]` | yes |
 | `ssherpa status <NAME>` | yes |
 | `ssherpa down <NAME> [--yes]` | yes |
 | `ssherpa ssh <NAME> [ssh args...]` | yes |
@@ -210,14 +241,16 @@ all:
     lab-01:
       ansible_host: 10.0.0.10
       ansible_user: admin
-      ansible_port: 22
       ansible_ssh_private_key_file: ~/.ssh/id_ed25519
 ```
 
-Two decisions worth knowing:
+Three decisions worth knowing:
 
 - **The format is Ansible's on purpose.** Later stages drive Ansible roles, and
   this file will be reused as-is rather than converted.
+- **Only what you gave is stored.** Fields you omitted are not filled with
+  defaults — at connect time they fall through to `~/.ssh/config`, exactly
+  like plain `ssh` would.
 - **Only connection details are stored.** What is installed and running is
   never written here — it is read from the host every time (`status` does
   exactly this), so the file cannot drift out of sync with reality.
