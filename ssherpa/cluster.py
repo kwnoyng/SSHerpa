@@ -165,13 +165,19 @@ def check_memory(node: Node, distro: Distro) -> None:
 def count_ready(status_output: str) -> int:
     """kubectl get nodes 출력에서 Ready 인 노드 수를 센다.
 
-    'NotReady' 도 두 번째 칸에 오므로 정확히 비교해야 한다.
+    STATUS 칸은 한 값이 아니라 쉼표로 이어붙인 목록이다. 노드를 cordon 하면
+    'Ready,SchedulingDisabled' 가 되는데, 칸을 통째로 비교하면 멀쩡히 Ready 인
+    그 노드를 세지 못한다. cordon/drain 은 이 도구를 쓰는 사람이 연습할 바로
+    그 동작이라, 연습해둔 클러스터에 up 을 다시 돌리면 300초를 기다렸다가
+    'only N of M nodes are Ready' 라는 틀린 진단을 받게 된다.
+
+    그래서 첫 칸만 본다 — 'NotReady' 도 거기 오므로 정확히 비교해야 한다.
     """
     ready = 0
     for line in status_output.splitlines():
         fields = line.split()
         # NAME STATUS ROLES AGE VERSION
-        if len(fields) >= 2 and fields[1] == "Ready":
+        if len(fields) >= 2 and fields[1].split(",")[0] == "Ready":
             ready += 1
     return ready
 
