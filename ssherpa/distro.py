@@ -17,6 +17,13 @@ from typing import Optional
 # k3s 설치는 이미지 내려받기까지 포함해 1분 가까이 걸린다.
 INSTALL_TIMEOUT = 600
 
+# 설정 파일 첫 줄에 남기는 표식. 이 파일은 통째로 덮어쓰이므로, 다음
+# 실행이 '내가 쓴 것인가' 를 알아볼 수 있어야 한다 — 사용자가 직접
+# 적어둔 설정을 지우고 서비스를 재시작하는 사고가 실제로 났다.
+CONFIG_MARKER = "# Managed by SSHerpa - remove this line to take ownership"
+CONFIG_OURS = "SSHERPA_CONFIG_OURS"
+CONFIG_FOREIGN = "SSHERPA_CONFIG_FOREIGN"
+
 
 @dataclass
 class Step:
@@ -61,16 +68,37 @@ class Distro:
     def tls_config_step(self, api_address: str) -> Step:
         """접속 주소를 인증서 SAN 에 넣도록 설정 파일을 쓴다.
 
-        이 파일은 SSHerpa 가 만들고 소유한다. 통째로 덮어쓰는 이유다.
+        통째로 덮어쓴다 — 그래서 쓰기 전에 이 파일이 우리 것인지
+        확인해야 한다(config_ownership_command 참고). 표식을 함께 남겨
+        다음 실행이 판단할 수 있게 한다.
         """
         directory = self.config_path.rsplit("/", 1)[0]
         return Step(
             label="configure tls-san",
             command=(
                 f"sudo mkdir -p {directory} && "
-                f"printf 'tls-san:\\n  - %s\\n' '{api_address}' "
+                f"printf '%s\\ntls-san:\\n  - %s\\n' '{CONFIG_MARKER}' '{api_address}' "
                 f"| sudo tee {self.config_path} >/dev/null"
             ),
+        )
+
+    def config_ownership_command(self) -> str:
+        """설정 파일이 우리 것인지 한 줄로 보고한다.
+
+        판단 순서:
+          - 파일이 없다        -> 우리가 만들 것이므로 우리 것
+          - 표식이 있다        -> 우리가 썼다
+          - tls-san 만 있다    -> 표식을 남기기 전(0.5.0 이하) 우리가 쓴 모양
+          - 그 밖의 내용이 있다 -> 남의 파일. 덮어쓰면 안 된다.
+        """
+        return (
+            f"test -f {self.config_path} || {{ echo {CONFIG_OURS}; exit 0; }}\n"
+            f"grep -qF '{CONFIG_MARKER}' {self.config_path} 2>/dev/null "
+            f"&& {{ echo {CONFIG_OURS}; exit 0; }}\n"
+            # tls-san 키와 그 목록, 빈 줄 말고 다른 것이 있으면 남의 파일이다
+            f"if sudo grep -vE '^(tls-san:[[:space:]]*|[[:space:]]+-[[:space:]].*|"
+            f"[[:space:]]*)$' {self.config_path} | grep -q .; "
+            f"then echo {CONFIG_FOREIGN}; else echo {CONFIG_OURS}; fi"
         )
 
     def refresh_certificate_step(self, api_address: str) -> Step:
