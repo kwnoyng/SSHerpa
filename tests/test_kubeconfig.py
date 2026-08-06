@@ -173,3 +173,64 @@ class TestRemove:
         before = kube_path.read_text()
         assert kubeconfig.remove("gcp-lab", path=kube_path) is False
         assert kube_path.read_text() == before
+
+
+class TestEmptiedByKubectl:
+    """kubectl 은 마지막 항목을 지우면 키를 남기고 값만 null 로 쓴다.
+
+    실측: `kubectl config delete-cluster` 로 정리한 직후의 ~/.kube/config 를
+    '망가진 파일' 로 보고 병합을 거부했다. 방금 정리한 사용자가 벌을 받는 셈이다.
+    """
+
+    EMPTIED = (
+        "apiVersion: v1\n"
+        "clusters: null\n"
+        "contexts: null\n"
+        "current-context: ssherpa-gone\n"
+        "kind: Config\n"
+        "users: null\n"
+    )
+
+    def test_null_sections_are_treated_as_empty(self, tmp_path):
+        path = tmp_path / "config"
+        path.write_text(self.EMPTIED, encoding="utf-8")
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert result.context == "ssherpa-lab-01"
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert [c["name"] for c in data["clusters"]] == ["ssherpa-lab-01"]
+        assert [c["name"] for c in data["contexts"]] == ["ssherpa-lab-01"]
+
+    def test_dangling_current_context_is_replaced(self, tmp_path):
+        # 가리키는 컨텍스트가 없는 current-context 를 존중하면, kubectl 은
+        # 계속 없는 것을 찾는다 — 비어 있는 것으로 본다
+        path = tmp_path / "config"
+        path.write_text(self.EMPTIED, encoding="utf-8")
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert result.became_current is True
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "ssherpa-lab-01"
+
+    def test_a_real_current_context_is_still_respected(self, tmp_path):
+        path = tmp_path / "config"
+        path.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "clusters:\n"
+            "- name: prod\n"
+            "  cluster: {server: 'https://prod:6443'}\n"
+            "contexts:\n"
+            "- name: prod\n"
+            "  context: {cluster: prod, user: prod}\n"
+            "users:\n"
+            "- name: prod\n"
+            "  user: {}\n"
+            "current-context: prod\n",
+            encoding="utf-8",
+        )
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert result.became_current is False
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "prod"

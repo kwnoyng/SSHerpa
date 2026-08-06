@@ -97,15 +97,33 @@ def merge(
         ("users", {"name": name, "user": user}),
         ("contexts", {"name": name, "context": {"cluster": name, "user": name}}),
     ):
-        section = data.setdefault(section_name, [])
+        section = data.get(section_name)
+        if section is None:
+            # kubectl 은 마지막 항목을 지우면 키를 남기고 값만 null 로 쓴다.
+            # 그 파일을 '망가진 것' 으로 취급하면, 방금 정리한 사용자가
+            # 병합에 실패한다 (실측: kubectl config delete-cluster 직후).
+            section = []
         if not isinstance(section, list):
             raise KubeconfigError(f"{path}: '{section_name}' is not a list")
         _upsert(section, item)
+        data[section_name] = section
 
-    became_current = False
-    if not data.get("current-context"):
+    # 남의 current-context 는 뺏지 않는다. 다만 그 이름이 가리키는 컨텍스트가
+    # 실제로 없으면(지워졌거나 null) 가리키는 곳이 없는 것이므로 비어 있는
+    # 것으로 본다 — 그대로 두면 kubectl 이 없는 컨텍스트를 계속 찾는다.
+    current = data.get("current-context")
+    names = {
+        entry.get("name")
+        for entry in data.get("contexts") or []
+        if isinstance(entry, dict)
+    }
+    if not current or current not in names:
         data["current-context"] = name
-        became_current = True
+
+    # '우리가 기본값이 됐나' 가 아니라 '결과적으로 우리가 기본값인가' 를
+    # 답한다. 재실행처럼 이미 우리 것이 기본값이던 경우에도 CLI 는
+    # kubectl 사용법을 정확히 안내해야 한다.
+    became_current = data.get("current-context") == name
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
