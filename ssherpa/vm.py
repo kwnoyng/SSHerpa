@@ -316,6 +316,12 @@ def create(
     with reporter.step("wait for ip"):
         mac, ip = wait_for_ip(target, spec.name)
 
+    # 지금 받은 주소를 이 VM 의 것으로 못박는다. 예약은 이미 있는 VM 에도
+    # 걸 수 있어서, 옛 버전이 만든 VM 도 재실행 한 번으로 주소가 고정된다.
+    reserve = reserve_ip_step(spec.name, mac, ip)
+    with reporter.step(reserve.label):
+        _run_step(target, reserve)
+
     return VmInfo(name=spec.name, ip=ip, mac=mac, already_existed=already)
 
 
@@ -337,37 +343,182 @@ _CLEAN_RULES = (
 )
 
 
+# 규칙을 세우는 스크립트와, 부팅 때 그것을 부르는 유닛. 둘 다 우리가
+# 만들고 소유하므로 통째로 덮어쓰고 통째로 지운다.
+FORWARD_SCRIPT = "/usr/local/bin/ssherpa-api-forward"
+FORWARD_UNIT = "ssherpa-api-forward.service"
+FORWARD_UNIT_PATH = f"/etc/systemd/system/{FORWARD_UNIT}"
+
+
+def forward_script(vm_ip: str) -> str:
+    """호스트의 6443 을 VM 으로 넘기는 규칙을 세우는 스크립트.
+
+    명령을 그때그때 실행하지 않고 스크립트로 남기는 이유: 지금 세우는
+    규칙과 재부팅 뒤에 다시 세울 규칙이 같은 코드여야 한다. 둘로 나뉘면
+    한쪽만 고쳐지는 날이 온다.
+
+    root 로 실행되므로 sudo 를 쓰지 않는다.
+
+    내용은 영어로 쓴다 — 이 파일은 고객사 호스트에 남아 그곳 관리자가
+    읽는다. 우리 저장소 안의 주석과 달리 여기는 사용자의 자리다.
+    """
+    return f"""#!/bin/sh
+# Managed by SSHerpa - do not edit.
+# Recreated by `ssherpa up <target> --vm`, removed by `ssherpa down <target>`.
+#
+# iptables rules live in kernel memory, so a reboot would otherwise leave the
+# VM running with no way in from outside. systemd runs this again at boot.
+set -e
+
+# Remove only rules carrying our tag. Deleting a rule (-D) needs the same
+# arguments it was added with, and the old address may no longer be known,
+# so they are found by the tag instead.
+clean() {{
+    iptables-save -t "$1" 2>/dev/null \\
+        | grep -F -- '{_RULE_TAG}' \\
+        | sed -e 's/^-A //' -e 's/"//g' \\
+        | while IFS= read -r rule; do iptables -t "$1" -D $rule; done
+}}
+clean nat
+clean filter
+
+iptables -t nat -A PREROUTING -p tcp --dport {API_PORT} \\
+    -m comment --comment {_RULE_TAG} \\
+    -j DNAT --to-destination {vm_ip}:{API_PORT}
+
+# libvirt puts a reject rule in FORWARD, so ours has to come first (-I 1).
+iptables -I FORWARD 1 -p tcp -d {vm_ip} --dport {API_PORT} \\
+    -m comment --comment {_RULE_TAG} -j ACCEPT
+"""
+
+
+def forward_unit() -> str:
+    """부팅 때 규칙을 다시 세우는 systemd 유닛.
+
+    배포판의 iptables-persistent 를 쓰지 않는 이유: 그것은 호스트의 모든
+    규칙을 저장하고 복원한다. 관리자가 일부러 지운 남의 규칙까지 되살리게
+    되므로, 우리 규칙만 다시 세우는 유닛을 따로 둔다.
+
+    libvirt 뒤에 실행해야 한다. libvirt 는 네트워크를 켤 때 FORWARD 에
+    자기 규칙을 넣는데, 우리가 먼저 들어가면 그 뒤로 밀려 거부당한다.
+    """
+    return f"""[Unit]
+Description=SSHerpa: forward the Kubernetes API port into the VM
+After=libvirtd.service virtnetworkd.service network-online.target
+Wants=libvirtd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={FORWARD_SCRIPT}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 def expose_api_step(vm_ip: str) -> Step:
     """호스트의 6443 을 VM 의 6443 으로 넘겨주는 통행 규칙(포트포워딩).
 
     내 PC 의 kubectl 은 NAT 안의 VM 주소에 직접 닿을 수 없다. 호스트
     주소로 접속하게 하고, 호스트가 VM 으로 전달한다 — 집 공유기의
-    포트포워딩과 같은 원리다. 옛 규칙을 걷어낸 뒤 추가하므로 VM 이
-    새 IP 로 재생성돼도 재실행이 곧 갱신이다.
+    포트포워딩과 같은 원리다.
+
+    규칙은 커널 메모리에만 살아서 재부팅이면 사라진다. 그래서 세우는
+    것으로 끝내지 않고, 부팅 때 다시 세우도록 등록까지 한다.
     """
     return Step(
         label="expose api port",
         command=(
             "set -e\n"
-            f"{_CLEAN_RULES}\n"
-            f"sudo iptables -t nat -A PREROUTING -p tcp --dport {API_PORT} "
-            f"-m comment --comment {_RULE_TAG} "
-            f"-j DNAT --to-destination {vm_ip}:{API_PORT}\n"
-            # libvirt 가 FORWARD 에 거부 규칙을 깔아두므로 그보다 앞(-I 1)이어야 한다
-            f"sudo iptables -I FORWARD 1 -p tcp -d {vm_ip} --dport {API_PORT} "
-            f"-m comment --comment {_RULE_TAG} -j ACCEPT"
+            f"sudo tee {FORWARD_SCRIPT} >/dev/null <<'SSHERPA_EOF'\n"
+            f"{forward_script(vm_ip)}"
+            "SSHERPA_EOF\n"
+            f"sudo chmod 755 {FORWARD_SCRIPT}\n"
+            f"sudo tee {FORWARD_UNIT_PATH} >/dev/null <<'SSHERPA_EOF'\n"
+            f"{forward_unit()}"
+            "SSHERPA_EOF\n"
+            "sudo systemctl daemon-reload\n"
+            f"sudo systemctl enable {FORWARD_UNIT} >/dev/null 2>&1\n"
+            # start 가 아니라 restart 다. 이미 적용된 유닛은 start 로 다시
+            # 실행되지 않아, 주소가 바뀐 재실행이 조용히 무시된다.
+            f"sudo systemctl restart {FORWARD_UNIT}"
+        ),
+    )
+
+
+def reserve_ip_step(name: str, mac: str, ip: str) -> Step:
+    """이 VM 이 앞으로도 같은 주소를 받도록 예약한다.
+
+    예약이 없으면 재부팅마다 주소가 달라질 수 있고(실측: .250 → .160 →
+    .231), 그러면 부팅 때 다시 세우는 규칙이 없는 VM 을 가리키게 된다.
+    주소를 고정하는 편이 규칙을 매번 다시 알아내는 것보다 단순하다.
+
+    이미 있는 예약은 걷어내고 다시 넣는다 — MAC 으로 한 번, IP 로 한 번.
+    지워진 VM 이 남긴 옛 예약이 같은 주소를 붙들고 있을 수 있다.
+    """
+    delete = (
+        "sudo virsh net-update default delete ip-dhcp-host "
+        "\"<host {}/>\" --live --config >/dev/null 2>&1 || true"
+    )
+    return Step(
+        label="reserve vm address",
+        command=(
+            delete.format(f"mac='{mac}'") + "\n"
+            + delete.format(f"ip='{ip}'") + "\n"
+            + "sudo virsh net-update default add ip-dhcp-host "
+            f"\"<host mac='{mac}' name='{name}' ip='{ip}'/>\" --live --config"
+        ),
+    )
+
+
+def release_ip_step(mac: str) -> Step:
+    """VM 이 사라지면 그 예약도 걷는다. 남겨두면 없는 MAC 이 주소를 붙든다."""
+    return Step(
+        label="release vm address",
+        command=(
+            "sudo virsh net-update default delete ip-dhcp-host "
+            f"\"<host mac='{mac}'/>\" --live --config >/dev/null 2>&1 || true"
         ),
     )
 
 
 def unexpose_api_step() -> Step:
-    return Step(label="close api port", command=_CLEAN_RULES)
+    """규칙과, 규칙을 다시 세우던 장치까지 함께 걷는다.
+
+    유닛만 남기면 다음 부팅에서 없는 VM 으로 가는 길을 다시 뚫는다.
+    """
+    return Step(
+        label="close api port",
+        command=(
+            f"sudo systemctl disable --now {FORWARD_UNIT} >/dev/null 2>&1 || true\n"
+            f"sudo rm -f {FORWARD_UNIT_PATH} {FORWARD_SCRIPT}\n"
+            "sudo systemctl daemon-reload\n"
+            # 유닛이 사라진 뒤에도 지금 서 있는 규칙은 남으므로 직접 걷는다
+            f"{_CLEAN_RULES}"
+        ),
+    )
 
 
 def expose_api(target: Target, vm_ip: str, reporter=None) -> None:
     step = expose_api_step(vm_ip)
     with (reporter or _NullReporter()).step(step.label):
         _run_step(target, step)
+
+        # 규칙이 지금 서 있는 것과 재부팅 뒤에도 서는 것은 다른 문제다.
+        # 등록까지 확인해야 "살아남는다"고 말할 수 있다.
+        state = run(target, f"systemctl is-enabled {FORWARD_UNIT} 2>/dev/null")
+        if state.stdout.strip() != "enabled":
+            raise VmError(
+                "the API forwarding rule would not survive a reboot",
+                [
+                    f"{FORWARD_UNIT} is "
+                    f"{state.stdout.strip() or 'not registered'} — the rule is "
+                    "in place now, but a restart of the host would drop it.",
+                    f"Inspect it:  ssherpa ssh {target.name or ''}".rstrip(),
+                    f"    systemctl status {FORWARD_UNIT}",
+                ],
+            )
 
 
 def unexpose_api(target: Target, reporter=None) -> None:
@@ -449,6 +600,9 @@ def destroy(target: Target, name: str, reporter=None) -> bool:
     with reporter.step("preflight"):
         if not vm_state(target, name):
             return False
+        # 주소 예약은 MAC 으로 걸려 있다. VM 을 지우고 나면 알아낼 수 없으니
+        # 먼저 읽어둔다.
+        mac = parse_mac(run(target, f"sudo virsh domiflist {name}", timeout=30).stdout)
 
     with reporter.step("destroy vm"):
         _run_step(
@@ -463,6 +617,11 @@ def destroy(target: Target, name: str, reporter=None) -> bool:
                 timeout=120,
             ),
         )
+
+    if mac:
+        release = release_ip_step(mac)
+        with reporter.step(release.label):
+            _run_step(target, release)
 
     # 제거 스크립트의 종료 코드를 믿지 않는다 — 실제로 사라졌는지 본다.
     with reporter.step("verify removal"):
