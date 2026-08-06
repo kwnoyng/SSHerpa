@@ -8,8 +8,8 @@ kubectl 은 환경변수가 없으면 ~/.kube/config 를 읽는다. up 이 가�
 
   - 쓰기 전에 원본을 백업한다
   - 'ssherpa-<타겟>' 이름이 붙은 우리 항목만 추가·교체·삭제한다
-  - current-context 는 원래 비어 있을 때만 잡는다. 다른 클러스터를 쓰던
-    사용자의 기본값을 몰래 바꾸면 그쪽 운영 사고로 이어질 수 있다.
+  - current-context 는 비어 있거나 우리 것이었을 때만 잡는다. 다른 클러스터를
+    쓰던 사용자의 기본값을 몰래 바꾸면 그쪽 운영 사고로 이어질 수 있다.
 """
 
 import contextlib
@@ -20,6 +20,10 @@ from typing import Optional
 import yaml
 
 SECTIONS = ("clusters", "users", "contexts")
+
+# 우리가 만든 항목에만 붙는 접두사. 남의 것과 우리 것을 가르는 유일한
+# 표시이므로 한 곳에서만 짓는다.
+ENTRY_PREFIX = "ssherpa-"
 
 # kubeconfig 는 클라이언트 인증서와 토큰을 담는다 — 관례가 0600 인 이유다.
 # Path.write_text 는 umask 를 따라 보통 0644 로 만들어, 공용 리눅스 장비에서
@@ -44,7 +48,7 @@ def default_path() -> Path:
 
 
 def entry_name(target_name: str) -> str:
-    return f"ssherpa-{target_name}"
+    return f"{ENTRY_PREFIX}{target_name}"
 
 
 @dataclass
@@ -109,10 +113,6 @@ def merge(
         if not backup.exists():
             write_private(backup, original)
 
-    # 병합하기 전에 이 파일에 컨텍스트가 있었는지 봐 둔다 — 뒤에서
-    # current-context 를 건드려도 되는지 판단하는 근거다.
-    had_contexts = bool(data.get("contexts"))
-
     for section_name, item in (
         ("clusters", {"name": name, "cluster": cluster}),
         ("users", {"name": name, "user": user}),
@@ -129,16 +129,30 @@ def merge(
         _upsert(section, item)
         data[section_name] = section
 
-    # 남의 current-context 는 뺏지 않는다. 다만 그 이름이 가리키는 컨텍스트가
-    # 실제로 없으면(지워졌거나 null) 가리키는 곳이 없는 것이므로 비어 있는
-    # 것으로 본다 — 그대로 두면 kubectl 이 없는 컨텍스트를 계속 찾는다.
     # 남의 current-context 는 뺏지 않는다. 여기 없는 이름을 가리킨다고 해서
-    # 고아라고 단정할 수도 없다 — KUBECONFIG 로 파일 여러 개를 엮어 쓰면
+    # 고아라고 단정할 수 없다 — KUBECONFIG 로 파일 여러 개를 엮어 쓰면
     # 컨텍스트 정의는 다른 파일에 있고 current-context 만 이 파일에 남는다.
     # 그걸 고아로 오판해 덮어쓰면 운영 클러스터를 쓰던 사람의 기본값이
-    # 조용히 랩으로 바뀐다. 그래서 '이 파일에 컨텍스트가 하나도 없었을 때'
-    # 로만 한정한다 — 그때는 빼앗을 남의 것 자체가 없다.
-    if not data.get("current-context") or not had_contexts:
+    # 조용히 랩으로 바뀐다.
+    #
+    # 그래서 기준은 '이 파일에 컨텍스트가 있었나' 가 아니라 '가리키는 이름이
+    # 우리 것인가' 다. 파일이 비어 보인다는 것은 빼앗을 것이 없다는 뜻이
+    # 아니다 — 체인의 첫 파일에는 포인터만 남는 배치가 실제로 만들어진다.
+    #
+    # 우리 이름인데 여기 없으면 우리가 만들었다가 사라진 것이므로 다시
+    # 잡는다. 그대로 두면 kubectl 이 없는 컨텍스트를 계속 찾는다.
+    current = data.get("current-context")
+    defined_here = [
+        item.get("name")
+        for item in data.get("contexts") or []
+        if isinstance(item, dict)
+    ]
+    ours_and_gone = (
+        isinstance(current, str)
+        and current.startswith(ENTRY_PREFIX)
+        and current not in defined_here
+    )
+    if not current or ours_and_gone:
         data["current-context"] = name
 
     # '우리가 기본값이 됐나' 가 아니라 '결과적으로 우리가 기본값인가' 를

@@ -204,8 +204,8 @@ class TestEmptiedByKubectl:
         assert [c["name"] for c in data["contexts"]] == ["ssherpa-lab-01"]
 
     def test_dangling_current_context_is_replaced(self, tmp_path):
-        # 가리키는 컨텍스트가 없는 current-context 를 존중하면, kubectl 은
-        # 계속 없는 것을 찾는다 — 비어 있는 것으로 본다
+        # 우리 이름을 가리키는데 그 컨텍스트가 없으면 kubectl 은 계속 없는
+        # 것을 찾는다 — 우리 것에 한해 비어 있는 걸로 본다
         path = tmp_path / "config"
         path.write_text(self.EMPTIED, encoding="utf-8")
         result = kubeconfig.merge(FETCHED, "lab-01", path=path)
@@ -267,8 +267,25 @@ class TestNeverStealsAnotherDefault:
         assert data["current-context"] == "prod-eks"
         assert result.became_current is False
 
-    def test_first_context_in_an_empty_file_may_claim_it(self, tmp_path):
-        # 컨텍스트가 하나도 없던 파일에는 빼앗을 남의 것이 없다
+    def test_a_pointer_alone_in_an_empty_file_is_still_theirs(self, tmp_path):
+        # 이 파일이 비어 보인다고 빼앗을 것이 없는 게 아니다 — 체인의 첫
+        # 파일에는 포인터만 남는 배치가 실제로 만들어진다. 컨텍스트 유무로
+        # 판정하면 여기서 남의 운영 기본값이 랩으로 바뀐다.
+        path = tmp_path / "config"
+        path.write_text(
+            "apiVersion: v1\nkind: Config\n"
+            "clusters: null\ncontexts: null\nusers: null\n"
+            "current-context: prod-eks\n",
+            encoding="utf-8",
+        )
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "prod-eks"
+        assert result.became_current is False
+
+    def test_our_own_dead_pointer_may_be_reclaimed(self, tmp_path):
+        # 우리 이름인데 여기 없으면 우리가 만들었다가 사라진 것이다.
+        # 그대로 두면 kubectl 이 없는 컨텍스트를 계속 찾는다.
         path = tmp_path / "config"
         path.write_text(
             "apiVersion: v1\nkind: Config\n"
@@ -280,6 +297,35 @@ class TestNeverStealsAnotherDefault:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert data["current-context"] == "ssherpa-lab-01"
         assert result.became_current is True
+
+    def test_another_live_ssherpa_context_is_left_alone(self, tmp_path):
+        # 우리 접두사가 붙었어도 여기 살아 있으면 사용자가 고른 기본값이다
+        path = tmp_path / "config"
+        path.write_text(
+            "apiVersion: v1\nkind: Config\n"
+            "clusters:\n- name: ssherpa-other\n  cluster: {server: 'https://o:6443'}\n"
+            "contexts:\n- name: ssherpa-other\n"
+            "  context: {cluster: ssherpa-other, user: ssherpa-other}\n"
+            "users:\n- name: ssherpa-other\n  user: {}\n"
+            "current-context: ssherpa-other\n",
+            encoding="utf-8",
+        )
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "ssherpa-other"
+        assert result.became_current is False
+
+    def test_a_mangled_contexts_entry_does_not_crash(self, tmp_path):
+        # 손으로 고친 파일에는 dict 가 아닌 항목이 섞일 수 있다
+        path = tmp_path / "config"
+        path.write_text(
+            "apiVersion: v1\nkind: Config\n"
+            "contexts:\n- just-a-string\n"
+            "current-context: prod-eks\n",
+            encoding="utf-8",
+        )
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert result.became_current is False
 
 
 @pytest.mark.skipif(
