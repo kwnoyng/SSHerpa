@@ -6,7 +6,10 @@ from ssherpa import cluster
 from ssherpa import distro as distro_mod
 from ssherpa.ssh import Target
 
-TARGET = Target(name="lab-01", host="34.50.34.61", user="ssherpa")
+# 주소는 RFC 5737 의 문서용 대역이다 — 라우팅되지 않으므로, 모킹을 빠뜨린
+# 테스트가 진짜 서버에 닿아 조용히 통과하는 일이 없다. 실제로 그렇게
+# 새어나간 적이 있다: 로컬에서는 키가 있어 통과하고 CI 에서만 깨졌다.
+TARGET = Target(name="lab-01", host="192.0.2.10", user="ssherpa")
 
 # k3s 가 실제로 만들어내는 kubeconfig 형태
 K3S_KUBECONFIG = """apiVersion: v1
@@ -370,6 +373,7 @@ class TestUpHealOrchestration:
         monkeypatch.setattr(cluster, "is_installed", lambda *_a: True)
         monkeypatch.setattr(cluster, "wait_for_ready", lambda *_a: None)
         monkeypatch.setattr(cluster, "api_reachable", lambda *_a, **_k: True)
+        monkeypatch.setattr(cluster, "config_is_ours", lambda *_a: True)
         monkeypatch.setattr(cluster, "fetch_kubeconfig", lambda *_a: fake_kubeconfig)
         monkeypatch.setattr(
             cluster.kubeconf,
@@ -698,3 +702,95 @@ class TestServiceNameInHints:
     def test_k3s_unit_is_not_k3s_server(self):
         # 실측: 'k3s-server' 는 존재하지 않아 journalctl 이 빈 결과를 낸다
         assert distro_mod.get("k3s").service == "k3s"
+
+
+class TestForeignConfigIsNotOverwritten:
+    """tls-san 은 설정 파일을 통째로 다시 써서 넣는다. 이미 k3s 가 깔린
+    호스트를 타겟으로 잡으면 그 파일은 사용자의 것일 수 있다.
+
+    실측(재현): disable/kube-apiserver-arg/node-label 이 적힌 config.yaml 이
+    두 줄짜리 tls-san 으로 바뀌고 k3s 가 재시작돼, 꺼뒀던 traefik 이
+    파드 4개로 되살아났다.
+    """
+
+    def _judge(self, monkeypatch, stdout):
+        monkeypatch.setattr(
+            cluster, "run", lambda *a, **k: cluster.CommandResult(0, stdout, "")  # noqa: ARG005
+        )
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+        return cluster.config_is_ours(node, distro_mod.get("k3s"))
+
+    def test_absent_file_is_ours_to_create(self, monkeypatch):
+        assert self._judge(monkeypatch, f"{distro_mod.CONFIG_OURS}\n") is True
+
+    def test_marked_file_is_ours(self, monkeypatch):
+        assert self._judge(monkeypatch, f"{distro_mod.CONFIG_OURS}\n") is True
+
+    def test_foreign_file_is_not(self, monkeypatch):
+        assert self._judge(monkeypatch, f"{distro_mod.CONFIG_FOREIGN}\n") is False
+
+    def test_probe_recognises_our_own_shape(self):
+        # 표식을 남기기 전(0.5.0 이하) 우리가 쓰던 파일은 tls-san 만 있다.
+        # 그것까지 남의 것으로 보면 기존 사용자가 갱신을 못 하게 된다.
+        command = distro_mod.get("k3s").config_ownership_command()
+        assert "tls-san:" in command
+        assert distro_mod.CONFIG_MARKER in command
+
+    def test_written_file_carries_the_marker(self):
+        # 표식이 없으면 다음 실행이 '내가 쓴 것' 임을 알 수 없다
+        command = distro_mod.get("k3s").tls_config_step("1.2.3.4").command
+        assert distro_mod.CONFIG_MARKER in command
+
+    def test_refresh_stops_instead_of_overwriting(self, monkeypatch, tmp_path):
+        kc = tmp_path / "kc.yaml"
+        kc.write_text("apiVersion: v1\n")
+        steps = []
+        monkeypatch.setattr(cluster, "is_installed", lambda *_a: True)
+        monkeypatch.setattr(cluster, "wait_for_ready", lambda *_a, **_k: None)
+        monkeypatch.setattr(cluster, "certificate_covers", lambda *_a: False)
+        monkeypatch.setattr(cluster, "config_is_ours", lambda *_a: False)
+        monkeypatch.setattr(cluster, "fetch_kubeconfig", lambda *_a: kc)
+        monkeypatch.setattr(cluster, "_run_step", lambda _n, s: steps.append(s.label))
+
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+        with pytest.raises(cluster.ClusterError) as excinfo:
+            cluster.up(node, distro_mod.get("k3s"))
+
+        assert "was not written by SSHerpa" in excinfo.value.message
+        assert steps == []  # 파일을 건드리지 않았다
+        assert any("tls-san:" in hint for hint in excinfo.value.hints)
+
+    def test_install_also_refuses_a_prepared_file(self, monkeypatch):
+        steps = []
+        monkeypatch.setattr(cluster, "is_installed", lambda *_a: False)
+        monkeypatch.setattr(cluster, "check_memory", lambda *_a: None)
+        monkeypatch.setattr(cluster, "config_is_ours", lambda *_a: False)
+        monkeypatch.setattr(cluster, "_run_step", lambda _n, s: steps.append(s.label))
+
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+        with pytest.raises(cluster.ClusterError):
+            cluster.up(node, distro_mod.get("k3s"))
+        assert steps == []
+
+    def test_ours_still_heals(self, monkeypatch, tmp_path):
+        # 우리 파일이면 예전처럼 고쳐야 한다 — 가드가 치유를 막으면 안 된다
+        kc = tmp_path / "kc.yaml"
+        kc.write_text("apiVersion: v1\n")
+        steps = []
+        answers = [False, True]
+        monkeypatch.setattr(cluster, "is_installed", lambda *_a: True)
+        monkeypatch.setattr(cluster, "wait_for_ready", lambda *_a, **_k: None)
+        monkeypatch.setattr(cluster, "certificate_covers", lambda *_a: answers.pop(0))
+        monkeypatch.setattr(cluster, "config_is_ours", lambda *_a: True)
+        monkeypatch.setattr(cluster, "fetch_kubeconfig", lambda *_a: kc)
+        monkeypatch.setattr(cluster, "api_reachable", lambda *_a, **_k: True)
+        monkeypatch.setattr(
+            cluster.kubeconf, "merge",
+            lambda *_a, **_k: cluster.kubeconf.MergeResult("c", True, None),
+        )
+        monkeypatch.setattr(cluster, "_run_step", lambda _n, s: steps.append(s.label))
+
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+        result = cluster.up(node, distro_mod.get("k3s"))
+        assert steps == ["refresh certificate"]
+        assert result.certificate_refreshed is True

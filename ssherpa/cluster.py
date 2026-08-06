@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import kubeconfig as kubeconf
-from .distro import Distro, Step
+from .distro import CONFIG_FOREIGN, Distro, Step
 from .ssh import CommandResult, Target, run
 
 API_PORT = 6443
@@ -209,6 +209,37 @@ def wait_for_ready(node: Node, distro: Distro, expected: int = 1) -> None:
     )
 
 
+def config_is_ours(node: Node, distro: Distro) -> bool:
+    """배포판 설정 파일을 우리가 덮어써도 되는가.
+
+    tls-san 은 파일을 통째로 다시 쓰는 방식으로 넣는다. 이미 k3s 가 깔린
+    호스트를 타겟으로 잡으면 그 파일에 사용자의 설정(disable, 데이터스토어
+    주소, apiserver 인자 …)이 들어 있을 수 있는데, 그대로 덮어쓰면 그것들이
+    사라진 채 서비스가 재시작된다 — 실측으로 꺼둔 컴포넌트가 되살아났다.
+    """
+    result = run(node.target, distro.config_ownership_command(), timeout=60)
+    return CONFIG_FOREIGN not in result.stdout
+
+
+def _foreign_config_error(distro: Distro, api_address: str) -> ClusterError:
+    return ClusterError(
+        f"{distro.config_path} was not written by SSHerpa",
+        [
+            "It holds settings SSHerpa did not put there, and the only way it",
+            "knows to add an address is to rewrite the whole file — which would",
+            "throw those settings away and restart the service.",
+            "",
+            f"Add the address yourself, so the certificate covers {api_address}:",
+            "",
+            "    tls-san:",
+            f"      - {api_address}",
+            "",
+            f"then restart {distro.service} and run this again. SSHerpa will",
+            "leave the file alone from then on.",
+        ],
+    )
+
+
 def parse_san_list(text: str) -> list[str]:
     """openssl 의 subjectAltName 출력에서 주소만 뽑는다.
 
@@ -364,6 +395,10 @@ def up(
         already = is_installed(node, distro)
         if not already:
             check_memory(node, distro)
+            # 설치 단계도 설정 파일을 쓴다. 아직 설치되지 않았어도 파일이
+            # 먼저 놓여 있을 수 있다(미리 준비해 둔 설정).
+            if not config_is_ours(node, distro):
+                raise _foreign_config_error(distro, api_address)
 
     if not already:
         for step in distro.install_steps(api_address):
@@ -389,6 +424,10 @@ def up(
         covered = certificate_covers(node, distro, api_address)
 
     if covered is False:
+        # 치유는 설정 파일을 다시 쓰는 일이다. 남의 파일이면 여기서 멈춘다 —
+        # 인증서를 고치자고 사용자의 클러스터 설정을 지울 수는 없다.
+        if not config_is_ours(node, distro):
+            raise _foreign_config_error(distro, api_address)
         with reporter.step("refresh certificate"):
             _run_step(node, distro.refresh_certificate_step(api_address))
             refreshed = True

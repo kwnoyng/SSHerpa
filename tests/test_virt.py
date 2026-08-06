@@ -9,7 +9,7 @@ import pytest
 from ssherpa import virt
 from ssherpa.ssh import CommandResult, Target
 
-TARGET = Target(name="gcp-lab", host="34.50.34.61", user="ssherpa")
+TARGET = Target(name="gcp-lab", host="192.0.2.10", user="ssherpa")
 
 
 def setup_probe_output(

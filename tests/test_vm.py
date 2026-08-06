@@ -9,7 +9,7 @@ import pytest
 from ssherpa import vm
 from ssherpa.ssh import CommandResult, Target
 
-TARGET = Target(name="gcp-lab", host="34.22.85.249", user="ssherpa")
+TARGET = Target(name="gcp-lab", host="192.0.2.10", user="ssherpa")
 PUBKEY = "ssh-ed25519 AAAATESTKEY ssherpa-vm"
 
 # virsh 가 실제로 만들어내는 표 형태
@@ -471,7 +471,7 @@ class TestVmTarget:
     def test_reaches_the_vm_through_the_host(self):
         built = vm.vm_target(TARGET, self.INFO)
         assert built.host == "192.168.122.160"
-        assert built.jump == "ssherpa@34.22.85.249"
+        assert built.jump == "ssherpa@192.0.2.10"
 
     def test_jump_keeps_the_host_port(self):
         host = Target(name="lab", host="10.0.0.1", user="admin", port=2222)
