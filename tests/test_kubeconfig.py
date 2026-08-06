@@ -5,6 +5,8 @@
 는 규칙을 고정한다.
 """
 
+import os
+
 import pytest
 import yaml
 
@@ -173,3 +175,139 @@ class TestRemove:
         before = kube_path.read_text()
         assert kubeconfig.remove("gcp-lab", path=kube_path) is False
         assert kube_path.read_text() == before
+
+
+class TestEmptiedByKubectl:
+    """kubectl 은 마지막 항목을 지우면 키를 남기고 값만 null 로 쓴다.
+
+    실측: `kubectl config delete-cluster` 로 정리한 직후의 ~/.kube/config 를
+    '망가진 파일' 로 보고 병합을 거부했다. 방금 정리한 사용자가 벌을 받는 셈이다.
+    """
+
+    EMPTIED = (
+        "apiVersion: v1\n"
+        "clusters: null\n"
+        "contexts: null\n"
+        "current-context: ssherpa-gone\n"
+        "kind: Config\n"
+        "users: null\n"
+    )
+
+    def test_null_sections_are_treated_as_empty(self, tmp_path):
+        path = tmp_path / "config"
+        path.write_text(self.EMPTIED, encoding="utf-8")
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert result.context == "ssherpa-lab-01"
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert [c["name"] for c in data["clusters"]] == ["ssherpa-lab-01"]
+        assert [c["name"] for c in data["contexts"]] == ["ssherpa-lab-01"]
+
+    def test_dangling_current_context_is_replaced(self, tmp_path):
+        # 가리키는 컨텍스트가 없는 current-context 를 존중하면, kubectl 은
+        # 계속 없는 것을 찾는다 — 비어 있는 것으로 본다
+        path = tmp_path / "config"
+        path.write_text(self.EMPTIED, encoding="utf-8")
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert result.became_current is True
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "ssherpa-lab-01"
+
+    def test_a_real_current_context_is_still_respected(self, tmp_path):
+        path = tmp_path / "config"
+        path.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "clusters:\n"
+            "- name: prod\n"
+            "  cluster: {server: 'https://prod:6443'}\n"
+            "contexts:\n"
+            "- name: prod\n"
+            "  context: {cluster: prod, user: prod}\n"
+            "users:\n"
+            "- name: prod\n"
+            "  user: {}\n"
+            "current-context: prod\n",
+            encoding="utf-8",
+        )
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert result.became_current is False
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "prod"
+
+
+class TestNeverStealsAnotherDefault:
+    """KUBECONFIG 로 파일을 여러 개 엮어 쓰면 컨텍스트 정의는 다른 파일에
+    있고 current-context 만 ~/.kube/config 에 남는다. 그걸 고아로 오판해
+    덮어쓰면 운영 클러스터를 쓰던 사람의 기본값이 조용히 랩으로 바뀐다.
+    """
+
+    def test_context_defined_elsewhere_is_left_alone(self, tmp_path):
+        path = tmp_path / "config"
+        path.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "clusters:\n"
+            "- name: staging\n"
+            "  cluster: {server: 'https://staging:6443'}\n"
+            "contexts:\n"
+            "- name: staging\n"
+            "  context: {cluster: staging, user: staging}\n"
+            "users:\n"
+            "- name: staging\n"
+            "  user: {}\n"
+            # prod-eks 는 KUBECONFIG 의 다른 파일에 정의돼 있다
+            "current-context: prod-eks\n",
+            encoding="utf-8",
+        )
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "prod-eks"
+        assert result.became_current is False
+
+    def test_first_context_in_an_empty_file_may_claim_it(self, tmp_path):
+        # 컨텍스트가 하나도 없던 파일에는 빼앗을 남의 것이 없다
+        path = tmp_path / "config"
+        path.write_text(
+            "apiVersion: v1\nkind: Config\n"
+            "clusters: null\ncontexts: null\nusers: null\n"
+            "current-context: ssherpa-gone\n",
+            encoding="utf-8",
+        )
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "ssherpa-lab-01"
+        assert result.became_current is True
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX permission bits do not exist on Windows"
+)
+class TestCredentialFilesArePrivate:
+    """kubeconfig 는 인증서와 토큰을 담는다. 기본 권한(0644)으로 만들면
+    공용 장비에서 같은 머신의 다른 계정이 남의 클러스터에 들어간다."""
+
+    def test_merged_config_is_owner_only(self, tmp_path):
+        path = tmp_path / "config"
+        kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert path.stat().st_mode & 0o077 == 0
+
+    def test_backup_is_owner_only(self, tmp_path):
+        path = tmp_path / "config"
+        path.write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert result.backup.stat().st_mode & 0o077 == 0
+
+    def test_backup_keeps_the_pre_ssherpa_original(self, tmp_path):
+        # 매번 덮어쓰면 두 번째 실행에서 이미 병합된 내용으로 바뀌어,
+        # 되돌릴 원본이 사라진다
+        path = tmp_path / "config"
+        original = "apiVersion: v1\nkind: Config\n# mine\n"
+        path.write_text(original, encoding="utf-8")
+
+        first = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        kubeconfig.merge(FETCHED, "lab-02", path=path)
+
+        assert first.backup.read_text(encoding="utf-8") == original

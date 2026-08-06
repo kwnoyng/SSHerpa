@@ -12,6 +12,7 @@ kubectl 은 환경변수가 없으면 ~/.kube/config 를 읽는다. up 이 가�
     사용자의 기본값을 몰래 바꾸면 그쪽 운영 사고로 이어질 수 있다.
 """
 
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -19,6 +20,19 @@ from typing import Optional
 import yaml
 
 SECTIONS = ("clusters", "users", "contexts")
+
+# kubeconfig 는 클라이언트 인증서와 토큰을 담는다 — 관례가 0600 인 이유다.
+# Path.write_text 는 umask 를 따라 보통 0644 로 만들어, 공용 리눅스 장비에서
+# 같은 머신의 다른 계정이 남의 클러스터 자격증명을 읽게 된다.
+PRIVATE_MODE = 0o600
+
+
+def write_private(path: Path, text: str) -> None:
+    """자격증명이 든 파일을 주인만 읽을 수 있게 쓴다."""
+    path.write_text(text, encoding="utf-8")
+    # Windows 에는 이 개념이 없다 — 못 바꿨다고 실패시킬 일은 아니다.
+    with contextlib.suppress(OSError):
+        path.chmod(PRIVATE_MODE)
 
 
 class KubeconfigError(Exception):
@@ -90,27 +104,51 @@ def merge(
     backup = None
     if original is not None:
         backup = path.with_name(path.name + ".ssherpa-backup")
-        backup.write_text(original, encoding="utf-8")
+        # 백업은 'SSHerpa 가 손대기 전' 을 담는다. 매번 덮어쓰면 두 번째
+        # 실행에서 이미 병합된 내용으로 바뀌어, 되돌릴 원본이 사라진다.
+        if not backup.exists():
+            write_private(backup, original)
+
+    # 병합하기 전에 이 파일에 컨텍스트가 있었는지 봐 둔다 — 뒤에서
+    # current-context 를 건드려도 되는지 판단하는 근거다.
+    had_contexts = bool(data.get("contexts"))
 
     for section_name, item in (
         ("clusters", {"name": name, "cluster": cluster}),
         ("users", {"name": name, "user": user}),
         ("contexts", {"name": name, "context": {"cluster": name, "user": name}}),
     ):
-        section = data.setdefault(section_name, [])
+        section = data.get(section_name)
+        if section is None:
+            # kubectl 은 마지막 항목을 지우면 키를 남기고 값만 null 로 쓴다.
+            # 그 파일을 '망가진 것' 으로 취급하면, 방금 정리한 사용자가
+            # 병합에 실패한다 (실측: kubectl config delete-cluster 직후).
+            section = []
         if not isinstance(section, list):
             raise KubeconfigError(f"{path}: '{section_name}' is not a list")
         _upsert(section, item)
+        data[section_name] = section
 
-    became_current = False
-    if not data.get("current-context"):
+    # 남의 current-context 는 뺏지 않는다. 다만 그 이름이 가리키는 컨텍스트가
+    # 실제로 없으면(지워졌거나 null) 가리키는 곳이 없는 것이므로 비어 있는
+    # 것으로 본다 — 그대로 두면 kubectl 이 없는 컨텍스트를 계속 찾는다.
+    # 남의 current-context 는 뺏지 않는다. 여기 없는 이름을 가리킨다고 해서
+    # 고아라고 단정할 수도 없다 — KUBECONFIG 로 파일 여러 개를 엮어 쓰면
+    # 컨텍스트 정의는 다른 파일에 있고 current-context 만 이 파일에 남는다.
+    # 그걸 고아로 오판해 덮어쓰면 운영 클러스터를 쓰던 사람의 기본값이
+    # 조용히 랩으로 바뀐다. 그래서 '이 파일에 컨텍스트가 하나도 없었을 때'
+    # 로만 한정한다 — 그때는 빼앗을 남의 것 자체가 없다.
+    if not data.get("current-context") or not had_contexts:
         data["current-context"] = name
-        became_current = True
+
+    # '우리가 기본값이 됐나' 가 아니라 '결과적으로 우리가 기본값인가' 를
+    # 답한다. 재실행처럼 이미 우리 것이 기본값이던 경우에도 CLI 는
+    # kubectl 사용법을 정확히 안내해야 한다.
+    became_current = data.get("current-context") == name
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(data, sort_keys=False, default_flow_style=False),
-        encoding="utf-8",
+    write_private(
+        path, yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
     )
     return MergeResult(context=name, became_current=became_current, backup=backup)
 

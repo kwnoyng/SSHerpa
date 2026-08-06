@@ -224,6 +224,23 @@ class TestProxyJump:
         assert "-J" in argv
         assert argv[argv.index("-J") + 1] == "ssherpa@34.22.85.249"
 
+    def test_vm_host_keys_are_kept_out_of_the_users_file(self):
+        # VM 주소는 NAT 풀에서 재활용되는데 VM 은 매번 새 키를 갖는다.
+        # 사용자의 ~/.ssh/known_hosts 에 섞으면 그 파일이 못 쓰게 된다.
+        vm_target = Target(
+            name="lab/ssherpa-node-1",
+            host="192.168.122.182",
+            user="ssherpa",
+            known_hosts="/home/me/.ssherpa/known_hosts",
+        )
+        argv = ssh._build_command(vm_target, "true")
+        assert "UserKnownHostsFile=/home/me/.ssherpa/known_hosts" in argv
+
+    def test_plain_targets_use_the_default_file(self):
+        # 진짜 호스트는 사용자의 known_hosts 로 검증돼야 한다
+        argv = ssh._build_command(TARGET, "true")
+        assert not any("UserKnownHostsFile" in arg for arg in argv)
+
     def test_no_jump_flag_without_jump(self):
         # -J 를 억지로 넘기면 ~/.ssh/config 의 ProxyJump 를 덮어쓴다
         assert "-J" not in ssh._build_command(TARGET, "true")
@@ -300,3 +317,29 @@ class TestSshConfigRespect:
         monkeypatch.setattr(ssh, "_find_default_keys", lambda: ["/home/x/.ssh/id_ed25519"])
         err = ssh._classify("x: Permission denied (publickey).", TARGET)
         assert "local" not in "\n".join(err.hints)
+
+
+class TestHostKeyHintNamesTheRightFile:
+    """VM 키는 전용 파일에 산다. 기본 파일을 고치라고 안내하면 시키는
+    대로 해도 아무것도 바뀌지 않는다 (실측)."""
+
+    CHANGED = (
+        "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n"
+        "Host key verification failed."
+    )
+
+    def test_vm_hint_points_at_our_file(self):
+        vm_target = Target(
+            name="lab/ssherpa-node-1",
+            host="192.168.122.182",
+            user="ssherpa",
+            known_hosts="/home/me/.ssherpa/known_hosts",
+        )
+        err = ssh._classify(self.CHANGED, vm_target)
+        line = next(h for h in err.hints if "ssh-keygen -R" in h)
+        assert "-f /home/me/.ssherpa/known_hosts" in line
+
+    def test_plain_host_hint_stays_simple(self):
+        err = ssh._classify(self.CHANGED, TARGET)
+        line = next(h for h in err.hints if "ssh-keygen -R" in h)
+        assert "-f " not in line

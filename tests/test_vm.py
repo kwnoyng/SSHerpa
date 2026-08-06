@@ -96,6 +96,76 @@ class TestSteps:
         assert "--autostart" in vm.boot_step(vm.VmSpec()).command
 
 
+class TestNodeNaming:
+    """이름이 결정적이라 재실행이 재사용이 되고, teardown 이 우리 것만 고른다."""
+
+    def test_names_are_numbered_from_one(self):
+        assert vm.node_name(1) == "ssherpa-node-1"
+        assert vm.node_name(3) == "ssherpa-node-3"
+
+    def test_specs_for_three_nodes(self):
+        specs = vm.specs_for(3)
+        assert [s.name for s in specs] == [
+            "ssherpa-node-1",
+            "ssherpa-node-2",
+            "ssherpa-node-3",
+        ]
+
+    def test_single_node_matches_the_default_spec(self):
+        # 노드 1개는 --nodes 가 없던 시절과 같은 VM 이어야 한다 —
+        # 이름이 달라지면 기존 사용자의 VM 이 재사용되지 않고 새로 생긴다
+        assert vm.specs_for(1)[0].name == vm.VmSpec().name
+
+    def test_every_node_carries_the_prefix(self):
+        assert all(s.name.startswith(vm.VM_PREFIX) for s in vm.specs_for(5))
+
+    def test_find_defaults_to_the_first_node(self, host):
+        # `ssherpa ssh --vm` 은 server 로 들어가야 한다
+        fake = host(state="running")
+        fake.state = "running"
+        assert vm.find(TARGET).name == "ssherpa-node-1"
+
+
+class TestRecycledAddresses:
+    """NAT 풀의 주소는 재활용되고, VM 은 매번 새 호스트 키를 갖는다.
+
+    실사용에서 발생: 지웠다 다시 만든 VM 이 앞서 쓰인 주소를 받자
+    'host key verification failed' 로 설치가 통째로 멈췄다.
+    """
+
+    def test_fresh_vm_forgets_the_old_key_for_its_address(self, host, monkeypatch):
+        host(state="")
+        forgotten = []
+        monkeypatch.setattr(vm, "forget_host_key", forgotten.append)
+        vm.create(TARGET)
+        assert forgotten == ["192.168.122.10"]
+
+    def test_reused_vm_keeps_its_key(self, host, monkeypatch):
+        # 돌고 있던 VM 은 키가 그대로다 — 지우면 검증을 스스로 포기하는 셈
+        host(state="running")
+        forgotten = []
+        monkeypatch.setattr(vm, "forget_host_key", forgotten.append)
+        vm.create(TARGET)
+        assert forgotten == []
+
+    def test_forgetting_targets_our_file_only(self, monkeypatch, tmp_path):
+        # 사용자의 ~/.ssh/known_hosts 는 우리가 손댈 파일이 아니다
+        ours = tmp_path / "known_hosts"
+        ours.write_text("192.168.122.10 ssh-ed25519 AAAA\n")
+        monkeypatch.setattr(vm, "known_hosts_path", lambda: ours)
+
+        calls = []
+        monkeypatch.setattr(
+            vm.subprocess, "run", lambda argv, **_k: calls.append(argv)
+        )
+        vm.forget_host_key("192.168.122.10")
+        assert calls == [["ssh-keygen", "-R", "192.168.122.10", "-f", str(ours)]]
+
+    def test_forgetting_is_harmless_without_a_file(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(vm, "known_hosts_path", lambda: tmp_path / "nope")
+        vm.forget_host_key("192.168.122.10")  # 예외 없이 지나가야 한다
+
+
 class TestSpecDefaults:
     def test_memory_matches_doctor_estimate(self):
         # doctor 가 "~N × 2 GB VMs" 라고 추정한 그 상수와 같아야 한다
@@ -318,11 +388,16 @@ class TestAddressReservation:
         assert "--config" in vm.reserve_ip_step("n", "m", "i").command
 
     def test_stale_reservations_are_cleared_first(self):
-        # 지워진 VM 이 남긴 예약이 같은 주소를 붙들고 있으면 add 가 실패한다.
-        # MAC 으로 한 번, IP 로 한 번 — 어느 쪽으로 남아 있든 걷어낸다.
-        command = vm.reserve_ip_step("n", "52:54:00:ab:cd:ef", "192.168.122.65").command
+        # libvirt 는 MAC·IP·이름 중 어느 하나만 겹쳐도 add 를 거절한다.
+        # 옛 예약이 어느 쪽으로 남아 있을지 모르니 셋 다 걷어낸다 —
+        # 손으로(virsh) 지운 VM 은 이름만 같은 예약을 남긴다 (실측).
+        command = vm.reserve_ip_step(
+            "ssherpa-node-3", "52:54:00:ab:cd:ef", "192.168.122.65"
+        ).command
         assert command.index("delete ip-dhcp-host") < command.index("add ip-dhcp-host")
-        assert command.count("delete ip-dhcp-host") == 2
+        assert command.count("delete ip-dhcp-host") == 3
+        for key in ("mac='52:54:00:ab:cd:ef'", "ip='192.168.122.65'", "name='ssherpa-node-3'"):
+            assert f"<host {key}/>" in command
 
     def test_release_only_deletes(self):
         command = vm.release_ip_step("52:54:00:ab:cd:ef").command
@@ -364,6 +439,19 @@ class TestListVms:
         )
         assert vm.list_vms(TARGET) == ["ssherpa-node-1"]
 
+    def test_order_is_by_name_not_by_power_state(self, monkeypatch):
+        # virsh 는 켜진 것을 먼저 늘어놓는다. 노드 하나가 꺼지면 목록 순서가
+        # 뒤집혀 읽기 어렵고, '첫 번째가 server' 라는 약속도 깨진다.
+        out = " ssherpa-node-1\nssherpa-node-4\nssherpa-node-2\n"
+        monkeypatch.setattr(
+            vm, "run", lambda *a, **k: CommandResult(0, out, "")  # noqa: ARG005
+        )
+        assert vm.list_vms(TARGET) == [
+            "ssherpa-node-1",
+            "ssherpa-node-2",
+            "ssherpa-node-4",
+        ]
+
     def test_host_without_virsh_reads_as_no_vms(self, monkeypatch):
         # host 모드만 쓰는 호스트에는 virsh 자체가 없다 — 오류가 아니다
         monkeypatch.setattr(
@@ -393,6 +481,10 @@ class TestVmTarget:
         built = vm.vm_target(TARGET, self.INFO)
         assert built.user == "ssherpa"  # user_data 가 만드는 계정과 같아야 한다
         assert built.key == str(vm.local_key_paths()[0])
+
+    def test_uses_our_own_known_hosts_file(self):
+        built = vm.vm_target(TARGET, self.INFO)
+        assert built.known_hosts == str(vm.known_hosts_path())
 
     def test_name_says_where_it_lives(self):
         assert vm.vm_target(TARGET, self.INFO).name == "gcp-lab/ssherpa-node-1"
@@ -454,3 +546,97 @@ class TestDestroy:
         with pytest.raises(vm.VmError) as excinfo:
             vm.destroy(TARGET, "ssherpa-node-1")
         assert "still defined" in excinfo.value.message
+
+
+class TestLookupDoesNotWait:
+    """조회 명령은 답이 좋아지기를 기다리면 안 된다.
+
+    실측: 주소 없는 VM 앞에서 `ssherpa status` 가 180초 동안 멈춰 있었다.
+    """
+
+    def _leaseless(self, monkeypatch, slept):
+        calls = []
+
+        def run(target, command, timeout=30):  # noqa: ARG001
+            calls.append(command)
+            if "virsh list" in command:
+                return CommandResult(0, "ssherpa-node-1\n", "")
+            if "domstate" in command:
+                return CommandResult(0, "running\n", "")
+            if "domiflist" in command:
+                return CommandResult(0, DOMIFLIST, "")
+            return CommandResult(0, "", "")  # 임대 장부가 비어 있다
+
+        monkeypatch.setattr(vm, "run", run)
+        monkeypatch.setattr(vm.time, "sleep", lambda s: slept.append(s))
+        return calls
+
+    def test_zero_timeout_looks_once_and_gives_up(self, monkeypatch):
+        slept = []
+        calls = self._leaseless(monkeypatch, slept)
+        with pytest.raises(vm.VmError):
+            vm.wait_for_ip(TARGET, "ssherpa-node-1", timeout=0)
+        assert slept == []
+        assert sum("net-dhcp-leases" in c for c in calls) == 1
+
+    def test_zero_timeout_says_what_is_true_now(self, monkeypatch):
+        # '0초 안에 못 받았다' 가 아니라 '아직 주소가 없다' 가 사실이다
+        self._leaseless(monkeypatch, [])
+        with pytest.raises(vm.VmError) as excinfo:
+            vm.wait_for_ip(TARGET, "ssherpa-node-1", timeout=0)
+        assert "no address yet" in excinfo.value.message
+        assert "0s" not in excinfo.value.message
+
+    def test_find_passes_the_timeout_through(self, monkeypatch):
+        slept = []
+        self._leaseless(monkeypatch, slept)
+        with pytest.raises(vm.VmError):
+            vm.find(TARGET, timeout=0)
+        assert slept == []
+
+    def test_building_a_vm_still_waits(self, monkeypatch):
+        # 만드는 쪽은 기다려야 한다 — 첫 부팅은 20초 남짓 걸린다
+        slept = []
+        self._leaseless(monkeypatch, slept)
+        with pytest.raises(vm.VmError):
+            vm.wait_for_ip(TARGET, "ssherpa-node-1", timeout=6)
+        assert slept  # 폴링했다
+
+
+class TestHostQueryFailuresAreNotSilence:
+    """'virsh 가 없다' 와 'virsh 가 대답을 못 한다' 는 다른 사실이다.
+
+    뭉뚱그리면 libvirtd 가 죽은 호스트에서 'VM 없음' 이라 답하게 되고,
+    down 은 멀쩡한 클러스터를 두고 "지울 것이 없다" 며 끝난다.
+    """
+
+    def test_host_without_virsh_is_not_an_error(self, monkeypatch):
+        monkeypatch.setattr(
+            vm, "run", lambda *a, **k: CommandResult(0, "SSHERPA_NO_VIRSH\n", "")  # noqa: ARG005
+        )
+        assert vm.list_vms(TARGET) == []
+
+    def test_virsh_that_cannot_answer_is_reported(self, monkeypatch):
+        monkeypatch.setattr(
+            vm,
+            "run",
+            lambda *a, **k: CommandResult(  # noqa: ARG005
+                1, "", "error: failed to connect to the hypervisor"
+            ),
+        )
+        with pytest.raises(vm.VmError) as excinfo:
+            vm.list_vms(TARGET)
+        assert "which VMs exist" in excinfo.value.message
+        assert any("libvirtd" in hint for hint in excinfo.value.hints)
+
+    def test_forwarding_leftovers_are_detectable(self, monkeypatch):
+        # VM 을 손으로 지워도 유닛과 스크립트는 남는다
+        monkeypatch.setattr(
+            vm, "run", lambda *a, **k: CommandResult(0, "", "")  # noqa: ARG005
+        )
+        assert vm.forwarding_installed(TARGET) is True
+
+        monkeypatch.setattr(
+            vm, "run", lambda *a, **k: CommandResult(1, "", "")  # noqa: ARG005
+        )
+        assert vm.forwarding_installed(TARGET) is False

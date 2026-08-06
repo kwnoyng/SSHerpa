@@ -10,6 +10,7 @@ Ubuntu LTS 하나로 고정하면 "VM 위 k3s" 조합을 하나만 검증하면 
 대응한다 (이 층은 그때도 바뀌지 않는다).
 """
 
+import contextlib
 import re
 import subprocess
 import time
@@ -57,12 +58,34 @@ class VmError(Exception):
 
 @dataclass
 class VmSpec:
-    """VM 한 대의 사양. 기본값이 곧 Phase A 의 결정이다."""
+    """VM 한 대의 사양. 기본값이 곧 지금의 결정이다."""
 
     name: str = f"{VM_PREFIX}node-1"
     memory_mb: int = PER_VM_MB  # doctor 의 용량 추정("~N × 2 GB VMs")과 같은 상수
     vcpus: int = 2
     disk_gb: int = 10  # 얇은 파일 — 실제로는 쓴 만큼만 차지한다
+
+
+def node_label(target_name: str, vm_name: str) -> str:
+    """CLI 가 이 VM 을 부르는 이름. kubeconfig 파일명과 컨텍스트가 여기서 나온다.
+
+    up 과 down 이 각자 이름을 지으면 한쪽 규칙만 바뀌었을 때 죽은 클러스터를
+    가리키는 항목이 로컬에 남는다 — 실측으로 겪었다. 그래서 한 곳에서만 짓는다.
+    """
+    return f"{target_name}-{vm_name.removeprefix(VM_PREFIX)}"
+
+
+def node_name(index: int) -> str:
+    """1 -> ssherpa-node-1. 이름이 결정적이라 재실행이 재사용이 되고,
+    teardown 은 접두사만 보고 우리 것만 골라낼 수 있다."""
+    return f"{VM_PREFIX}node-{index}"
+
+
+def specs_for(count: int, memory_mb: int = PER_VM_MB) -> list[VmSpec]:
+    """노드 수만큼의 사양 목록. 첫 번째가 server 가 된다."""
+    return [
+        VmSpec(name=node_name(i), memory_mb=memory_mb) for i in range(1, count + 1)
+    ]
 
 
 @dataclass
@@ -76,6 +99,37 @@ class VmInfo:
 def local_key_paths() -> tuple[Path, Path]:
     base = Path.home() / ".ssherpa" / "vm_ed25519"
     return base, base.with_suffix(".pub")
+
+
+def known_hosts_path() -> Path:
+    """VM 접속에만 쓰는 known_hosts.
+
+    사용자의 ~/.ssh/known_hosts 에 VM 을 기록하면 안 되는 이유가 있다.
+    VM 주소는 NAT 풀(192.168.122.x)에서 재활용되는데 VM 은 새로 만들 때마다
+    새 호스트 키를 발급받는다. 그래서 같은 주소에 다른 키가 오는 일이
+    반드시 반복되고, ssh 는 그때마다 중간자 공격으로 의심해 접속을 끊는다
+    (실사용에서 발생). 우리 파일로 분리해 두면 사용자의 진짜 호스트 기록을
+    더럽히지 않고, 우리 쪽 항목만 정리할 수 있다.
+    """
+    return Path.home() / ".ssherpa" / "known_hosts"
+
+
+def forget_host_key(address: str) -> None:
+    """이 주소로 기억해둔 옛 VM 의 키를 지운다.
+
+    새로 만든 VM 은 반드시 새 키를 갖는다 — 그러니 남아 있던 기록은
+    맞을 수가 없다. 지우면 다음 접속이 accept-new 로 정상 등록된다.
+    """
+    path = known_hosts_path()
+    if not path.exists():
+        return
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            ["ssh-keygen", "-R", address, "-f", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 def ensure_local_key() -> str:
@@ -254,9 +308,15 @@ def _run_step(target: Target, step: Step) -> None:
         )
 
 
-def wait_for_ip(target: Target, name: str) -> tuple[str, str]:
+def wait_for_ip(
+    target: Target, name: str, timeout: int = IP_TIMEOUT
+) -> tuple[str, str]:
     """(mac, ip) 를 돌려준다. 가상 공유기의 임대 장부에 IP 가 올라올
-    때까지 기다린다 — 첫 부팅은 cloud-init 까지 1분 안팎이 걸린다."""
+    때까지 기다린다 — 첫 부팅은 cloud-init 까지 1분 안팎이 걸린다.
+
+    timeout=0 이면 한 번만 보고 만다. 상태를 '조회' 하는 쪽은 기다리면
+    안 된다 — status 가 주소 없는 VM 앞에서 3분간 멈춰 있었다 (실측).
+    """
     iflist = run(target, f"sudo virsh domiflist {name}", timeout=30)
     mac = parse_mac(iflist.stdout)
     if not mac:
@@ -266,16 +326,25 @@ def wait_for_ip(target: Target, name: str) -> tuple[str, str]:
              f"Inspect it on the host:  sudo virsh dumpxml {name}"],
         )
 
-    deadline = time.monotonic() + IP_TIMEOUT
-    while time.monotonic() < deadline:
+    deadline = time.monotonic() + timeout
+    while True:
         leases = run(target, "sudo virsh net-dhcp-leases default", timeout=30)
         ip = parse_lease_ip(leases.stdout, mac)
         if ip:
             return mac, ip
+        if time.monotonic() >= deadline:
+            break
         time.sleep(IP_POLL_INTERVAL)
 
+    # 기다리지 않기로 한 호출(조회 명령)에는 '시간이 모자랐다' 가 아니라
+    # '지금은 주소가 없다' 가 사실이다.
+    message = (
+        f"{name} has no address yet"
+        if timeout <= 0
+        else f"{name} did not obtain an IP within {timeout}s"
+    )
     raise VmError(
-        f"{name} did not obtain an IP within {IP_TIMEOUT}s",
+        message,
         [
             "The VM is defined but never reached the DHCP handshake.",
             "Watch it boot from the host console:",
@@ -315,6 +384,12 @@ def create(
 
     with reporter.step("wait for ip"):
         mac, ip = wait_for_ip(target, spec.name)
+
+    # 방금 만든 VM 은 새 호스트 키를 갖는다. 이 주소로 기억해둔 옛 키가
+    # 남아 있으면 ssh 가 키 변경으로 보고 접속을 끊는다 — 주소가 풀에서
+    # 재활용되므로 반드시 일어나는 일이다 (실사용에서 발생).
+    if not already:
+        forget_host_key(ip)
 
     # 지금 받은 주소를 이 VM 의 것으로 못박는다. 예약은 이미 있는 VM 에도
     # 걸 수 있어서, 옛 버전이 만든 VM 도 재실행 한 번으로 주소가 고정된다.
@@ -454,8 +529,10 @@ def reserve_ip_step(name: str, mac: str, ip: str) -> Step:
     .231), 그러면 부팅 때 다시 세우는 규칙이 없는 VM 을 가리키게 된다.
     주소를 고정하는 편이 규칙을 매번 다시 알아내는 것보다 단순하다.
 
-    이미 있는 예약은 걷어내고 다시 넣는다 — MAC 으로 한 번, IP 로 한 번.
-    지워진 VM 이 남긴 옛 예약이 같은 주소를 붙들고 있을 수 있다.
+    이미 있는 예약은 걷어내고 다시 넣는다 — MAC, IP, 이름 셋 모두로 한 번씩.
+    libvirt 는 이 셋 중 어느 하나만 겹쳐도 add 를 거절하는데, 옛 예약이
+    어느 쪽으로 남아 있을지는 알 수 없다. VM 을 `ssherpa down` 이 아니라
+    손으로(virsh) 지우면 이름만 같고 MAC 은 다른 예약이 남는다 (실측).
     """
     delete = (
         "sudo virsh net-update default delete ip-dhcp-host "
@@ -466,6 +543,7 @@ def reserve_ip_step(name: str, mac: str, ip: str) -> Step:
         command=(
             delete.format(f"mac='{mac}'") + "\n"
             + delete.format(f"ip='{ip}'") + "\n"
+            + delete.format(f"name='{name}'") + "\n"
             + "sudo virsh net-update default add ip-dhcp-host "
             f"\"<host mac='{mac}' name='{name}' ip='{ip}'/>\" --live --config"
         ),
@@ -527,29 +605,79 @@ def unexpose_api(target: Target, reporter=None) -> None:
         _run_step(target, step)
 
 
+_NO_VIRSH = "SSHERPA_NO_VIRSH"
+
+
 def list_vms(target: Target) -> list[str]:
     """호스트에 있는 SSHerpa 소유 VM 이름 목록.
 
+    virsh 는 켜진 것을 먼저, 꺼진 것을 나중에 늘어놓는다. 그대로 쓰면
+    꺼진 노드 하나 때문에 목록 순서가 뒤집혀 읽기 어려우므로 이름순으로
+    돌려준다 — 첫 번째가 언제나 server(node-1) 라는 약속도 여기 걸려 있다.
+
     virsh 가 없는 호스트(host 모드만 쓰는)는 빈 목록이다 — 오류가 아니다.
+    하지만 virsh 가 있는데 대답하지 못하는 것은 다르다. 둘을 뭉뚱그리면
+    libvirtd 가 죽은 호스트에서 'VM 없음' 이라 답하게 되고, down 은
+    멀쩡한 클러스터를 두고 "지울 것이 없다" 며 끝난다.
     """
-    result = run(target, "sudo virsh list --all --name 2>/dev/null || true")
-    return [
+    result = run(
+        target,
+        f"command -v virsh >/dev/null 2>&1 || {{ echo {_NO_VIRSH}; exit 0; }}\n"
+        "sudo virsh list --all --name",
+    )
+    if _NO_VIRSH in result.stdout:
+        return []
+    if result.rc != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise VmError(
+            "could not ask the host which VMs exist",
+            (detail[-2:] if detail else [])
+            + [
+                "virsh is installed but did not answer, so SSHerpa cannot tell",
+                "whether a VM cluster is running here.",
+                "    systemctl status libvirtd",
+            ],
+        )
+    return sorted(
         line.strip()
         for line in result.stdout.splitlines()
         if line.strip().startswith(VM_PREFIX)
-    ]
+    )
 
 
-def find(target: Target) -> Optional[VmInfo]:
+def forwarding_installed(target: Target) -> bool:
+    """포워딩 장치가 호스트에 남아 있는가.
+
+    VM 을 손으로 지운 뒤에도 유닛과 스크립트는 남는다. 그 상태를 모르면
+    down 이 그것들을 지나쳐, 부팅마다 없는 주소로 6443 을 넘기는 규칙이
+    되살아난다.
+    """
+    result = run(target, f"test -f {FORWARD_UNIT_PATH} || test -f {FORWARD_SCRIPT}")
+    return result.rc == 0
+
+
+def find(
+    target: Target,
+    name: Optional[str] = None,
+    timeout: int = IP_TIMEOUT,
+) -> Optional[VmInfo]:
     """호스트의 SSHerpa VM 을 찾아 접속 정보(IP)까지 채운다. 없으면 None.
+
+    이름을 주지 않으면 첫 번째(server) 노드를 고른다 — `ssherpa ssh --vm`
+    처럼 "그 VM"이라고만 말했을 때 들어갈 곳이다.
+
+    timeout=0 은 '기다리지 말고 지금 상태만' 이라는 뜻이다. 조회 명령은
+    답을 만들어내려 기다리면 안 된다.
 
     켜져 있지 않으면 오류다 — IP 는 살아 있는 VM 만 갖는다.
     """
     names = list_vms(target)
     if not names:
         return None
+    if name is not None and name not in names:
+        return None
 
-    name = names[0]
+    name = name or sorted(names)[0]
     state = vm_state(target, name)
     if state != "running":
         label = target.name or "<target>"
@@ -561,7 +689,7 @@ def find(target: Target) -> Optional[VmInfo]:
             ],
         )
 
-    mac, ip = wait_for_ip(target, name)
+    mac, ip = wait_for_ip(target, name, timeout=timeout)
     return VmInfo(name=name, ip=ip, mac=mac, already_existed=True)
 
 
@@ -580,6 +708,7 @@ def vm_target(host: Target, info: VmInfo) -> Target:
         user="ssherpa",  # cloud-init 이 만든 계정 (user_data 참고)
         key=str(private),
         jump=host.jump_spec(),
+        known_hosts=str(known_hosts_path()),
     )
 
 

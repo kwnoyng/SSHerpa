@@ -44,6 +44,7 @@ class Target:
     port: Optional[int] = None
     key: Optional[str] = None
     jump: Optional[str] = None  # -J 에 넘길 경유지 (user@host[:port])
+    known_hosts: Optional[str] = None  # 이 접속에만 쓸 known_hosts 파일
 
     def destination(self) -> str:
         """ssh 에 넘길 목적지. user 미지정이면 host 만 (config 가 정함)."""
@@ -102,6 +103,8 @@ def _build_command(target: Target, remote_command: str) -> list[str]:
         argv += ["-i", os.path.expanduser(target.key)]
     if target.jump:
         argv += ["-J", target.jump]
+    if target.known_hosts:
+        argv += ["-o", f"UserKnownHostsFile={os.path.expanduser(target.known_hosts)}"]
     # '--' 뒤로는 ssh 가 옵션을 찾지 않는다. 목적지가 '-' 로 시작하면
     # (예: '-oProxyCommand=...') ssh 는 그것을 옵션으로 읽어 실행해 버린다.
     # 여기서는 목적지 다음이 항상 우리가 만든 원격 명령이라 '--' 를 넣어도
@@ -258,11 +261,17 @@ def _classify(stderr: str, target: Target) -> SSHError:
         )
 
     if "host key verification failed" in lower or "identification has changed" in lower:
+        # 어느 파일에 기록됐는지에 따라 고치는 명령이 다르다. 이 접속이
+        # 전용 known_hosts 를 쓰는데 기본 파일을 고치라고 안내하면,
+        # 시키는 대로 해도 아무것도 바뀌지 않는다 (실측).
+        forget = f"ssh-keygen -R {target.host}"
+        if target.known_hosts:
+            forget += f" -f {target.known_hosts}"
         return SSHError(
             "host key verification failed",
             [
                 "If you reinstalled the target, remove the old key:",
-                f"    ssh-keygen -R {target.host}",
+                f"    {forget}",
                 "If this change was unexpected, it could be a man-in-the-middle attack",
             ],
         )

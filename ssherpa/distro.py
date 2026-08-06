@@ -39,9 +39,24 @@ class Distro:
     summary: str  # 선택 프롬프트에 보여줄 한 줄 설명
     config_path: str  # tls-san 을 담는 설정 파일 (SSHerpa 가 소유·관리)
     serving_cert_path: str  # API 서버 serving 인증서 — SAN 검사에 쓴다
+    token_path: str  # server 가 발급한 합류 토큰. agent 가 이걸로 들어온다
+    join_port: int  # agent 가 두드릴 포트. 배포판마다 다르다
 
     def install_steps(self, api_address: str) -> list[Step]:
         raise NotImplementedError
+
+    def agent_install_steps(self, server_address: str, token: str) -> list[Step]:
+        """이 노드를 기존 클러스터에 agent 로 합류시킨다.
+
+        server 는 자기가 만든 토큰을 아는 노드만 받아들인다. 그래서 순서가
+        정해져 있다 — server 를 먼저 세우고, 거기서 토큰을 읽어, agent 에게
+        건넨다. 병렬로 시작할 수 없는 이유다.
+        """
+        raise NotImplementedError
+
+    def read_token_command(self) -> str:
+        """server 가 발급한 합류 토큰을 읽는다 (root 만 읽을 수 있다)."""
+        return f"sudo cat {self.token_path}"
 
     def tls_config_step(self, api_address: str) -> Step:
         """접속 주소를 인증서 SAN 에 넣도록 설정 파일을 쓴다.
@@ -123,6 +138,8 @@ class K3s(Distro):
             serving_cert_path=(
                 "/var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt"
             ),
+            token_path="/var/lib/rancher/k3s/server/node-token",
+            join_port=6443,  # k3s 는 API 포트로 합류를 받는다
         )
 
     def install_steps(self, api_address: str) -> list[Step]:
@@ -135,6 +152,20 @@ class K3s(Distro):
                 command="curl -sfL https://get.k3s.io | sudo sh -",
                 timeout=INSTALL_TIMEOUT,
             ),
+        ]
+
+    def agent_install_steps(self, server_address: str, token: str) -> list[Step]:
+        # 같은 설치 스크립트가 K3S_URL 유무로 server/agent 를 가른다.
+        return [
+            Step(
+                label="join cluster",
+                command=(
+                    "curl -sfL https://get.k3s.io | sudo "
+                    f"K3S_URL=https://{server_address}:{self.join_port} "
+                    f"K3S_TOKEN='{token}' sh -"
+                ),
+                timeout=INSTALL_TIMEOUT,
+            )
         ]
 
 
@@ -155,6 +186,10 @@ class RKE2(Distro):
             serving_cert_path=(
                 "/var/lib/rancher/rke2/server/tls/serving-kube-apiserver.crt"
             ),
+            token_path="/var/lib/rancher/rke2/server/node-token",
+            # RKE2 는 API(6443) 와 별도로 supervisor 포트로 합류를 받는다.
+            # 6443 으로 보내면 붙는 듯하다 조용히 실패한다.
+            join_port=9345,
         )
 
     def uninstall_steps(self) -> list[Step]:
@@ -185,6 +220,35 @@ class RKE2(Distro):
             Step(
                 label="start rke2",
                 command="sudo systemctl enable --now rke2-server.service",
+                timeout=INSTALL_TIMEOUT,
+            ),
+        ]
+
+    def agent_install_steps(self, server_address: str, token: str) -> list[Step]:
+        # agent 도 설치·설정·기동이 분리돼 있고, 설정은 server 와 같은
+        # config.yaml 자리를 쓴다 (tls-san 대신 server/token 을 담는다).
+        directory = self.config_path.rsplit("/", 1)[0]
+        return [
+            Step(
+                label="install rke2 agent",
+                command=(
+                    "curl -sfL https://get.rke2.io | "
+                    "sudo INSTALL_RKE2_TYPE=agent sh -"
+                ),
+                timeout=INSTALL_TIMEOUT,
+            ),
+            Step(
+                label="configure join",
+                command=(
+                    f"sudo mkdir -p {directory} && "
+                    f"printf 'server: https://%s:%s\\ntoken: %s\\n' "
+                    f"'{server_address}' '{self.join_port}' '{token}' "
+                    f"| sudo tee {self.config_path} >/dev/null"
+                ),
+            ),
+            Step(
+                label="join cluster",
+                command="sudo systemctl enable --now rke2-agent.service",
                 timeout=INSTALL_TIMEOUT,
             ),
         ]
