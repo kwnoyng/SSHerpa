@@ -546,3 +546,58 @@ class TestDestroy:
         with pytest.raises(vm.VmError) as excinfo:
             vm.destroy(TARGET, "ssherpa-node-1")
         assert "still defined" in excinfo.value.message
+
+
+class TestLookupDoesNotWait:
+    """조회 명령은 답이 좋아지기를 기다리면 안 된다.
+
+    실측: 주소 없는 VM 앞에서 `ssherpa status` 가 180초 동안 멈춰 있었다.
+    """
+
+    def _leaseless(self, monkeypatch, slept):
+        calls = []
+
+        def run(target, command, timeout=30):  # noqa: ARG001
+            calls.append(command)
+            if "virsh list" in command:
+                return CommandResult(0, "ssherpa-node-1\n", "")
+            if "domstate" in command:
+                return CommandResult(0, "running\n", "")
+            if "domiflist" in command:
+                return CommandResult(0, DOMIFLIST, "")
+            return CommandResult(0, "", "")  # 임대 장부가 비어 있다
+
+        monkeypatch.setattr(vm, "run", run)
+        monkeypatch.setattr(vm.time, "sleep", lambda s: slept.append(s))
+        return calls
+
+    def test_zero_timeout_looks_once_and_gives_up(self, monkeypatch):
+        slept = []
+        calls = self._leaseless(monkeypatch, slept)
+        with pytest.raises(vm.VmError):
+            vm.wait_for_ip(TARGET, "ssherpa-node-1", timeout=0)
+        assert slept == []
+        assert sum("net-dhcp-leases" in c for c in calls) == 1
+
+    def test_zero_timeout_says_what_is_true_now(self, monkeypatch):
+        # '0초 안에 못 받았다' 가 아니라 '아직 주소가 없다' 가 사실이다
+        self._leaseless(monkeypatch, [])
+        with pytest.raises(vm.VmError) as excinfo:
+            vm.wait_for_ip(TARGET, "ssherpa-node-1", timeout=0)
+        assert "no address yet" in excinfo.value.message
+        assert "0s" not in excinfo.value.message
+
+    def test_find_passes_the_timeout_through(self, monkeypatch):
+        slept = []
+        self._leaseless(monkeypatch, slept)
+        with pytest.raises(vm.VmError):
+            vm.find(TARGET, timeout=0)
+        assert slept == []
+
+    def test_building_a_vm_still_waits(self, monkeypatch):
+        # 만드는 쪽은 기다려야 한다 — 첫 부팅은 20초 남짓 걸린다
+        slept = []
+        self._leaseless(monkeypatch, slept)
+        with pytest.raises(vm.VmError):
+            vm.wait_for_ip(TARGET, "ssherpa-node-1", timeout=6)
+        assert slept  # 폴링했다

@@ -679,3 +679,22 @@ class TestStepLabels:
 
         assert any(label.startswith("node-2: ") for label in labels)
         assert any(label.startswith("node-3: ") for label in labels)
+
+
+class TestServiceNameInHints:
+    """유닛 이름은 배포판이 정한다 — 이름에서 지어내면 k3s 쪽이 틀린다."""
+
+    def test_hint_uses_the_declared_service(self, monkeypatch):
+        monkeypatch.setattr(cluster, "run", lambda *a, **k: cluster.CommandResult(0, "", ""))  # noqa: ARG005
+        monkeypatch.setattr(cluster, "READY_TIMEOUT", 0)
+        node = cluster.nodes_for_host_mode(TARGET)[0]
+        for name in ("k3s", "rke2"):
+            chosen = distro_mod.get(name)
+            with pytest.raises(cluster.ClusterError) as excinfo:
+                cluster.wait_for_ready(node, chosen)
+            line = next(h for h in excinfo.value.hints if "journalctl" in h)
+            assert f"-u {chosen.service} " in line
+
+    def test_k3s_unit_is_not_k3s_server(self):
+        # 실측: 'k3s-server' 는 존재하지 않아 journalctl 이 빈 결과를 낸다
+        assert distro_mod.get("k3s").service == "k3s"

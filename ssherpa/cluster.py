@@ -202,7 +202,9 @@ def wait_for_ready(node: Node, distro: Distro, expected: int = 1) -> None:
         [
             "The install finished but the cluster never reached the expected size.",
             f"Inspect the service:  {node.cli_ssh()}",
-            f"    sudo journalctl -u {distro.name}-server -n 50",
+            # 유닛 이름은 배포판이 정한다 — k3s 는 'k3s', RKE2 는
+            # 'rke2-server'. 이름에서 지어내면 k3s 쪽이 틀린다 (실측).
+            f"    sudo journalctl -u {distro.service} -n 50",
         ],
     )
 

@@ -234,3 +234,47 @@ class TestEmptiedByKubectl:
 
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert data["current-context"] == "prod"
+
+
+class TestNeverStealsAnotherDefault:
+    """KUBECONFIG 로 파일을 여러 개 엮어 쓰면 컨텍스트 정의는 다른 파일에
+    있고 current-context 만 ~/.kube/config 에 남는다. 그걸 고아로 오판해
+    덮어쓰면 운영 클러스터를 쓰던 사람의 기본값이 조용히 랩으로 바뀐다.
+    """
+
+    def test_context_defined_elsewhere_is_left_alone(self, tmp_path):
+        path = tmp_path / "config"
+        path.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "clusters:\n"
+            "- name: staging\n"
+            "  cluster: {server: 'https://staging:6443'}\n"
+            "contexts:\n"
+            "- name: staging\n"
+            "  context: {cluster: staging, user: staging}\n"
+            "users:\n"
+            "- name: staging\n"
+            "  user: {}\n"
+            # prod-eks 는 KUBECONFIG 의 다른 파일에 정의돼 있다
+            "current-context: prod-eks\n",
+            encoding="utf-8",
+        )
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "prod-eks"
+        assert result.became_current is False
+
+    def test_first_context_in_an_empty_file_may_claim_it(self, tmp_path):
+        # 컨텍스트가 하나도 없던 파일에는 빼앗을 남의 것이 없다
+        path = tmp_path / "config"
+        path.write_text(
+            "apiVersion: v1\nkind: Config\n"
+            "clusters: null\ncontexts: null\nusers: null\n"
+            "current-context: ssherpa-gone\n",
+            encoding="utf-8",
+        )
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["current-context"] == "ssherpa-lab-01"
+        assert result.became_current is True

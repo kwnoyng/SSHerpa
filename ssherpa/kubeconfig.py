@@ -92,6 +92,10 @@ def merge(
         backup = path.with_name(path.name + ".ssherpa-backup")
         backup.write_text(original, encoding="utf-8")
 
+    # 병합하기 전에 이 파일에 컨텍스트가 있었는지 봐 둔다 — 뒤에서
+    # current-context 를 건드려도 되는지 판단하는 근거다.
+    had_contexts = bool(data.get("contexts"))
+
     for section_name, item in (
         ("clusters", {"name": name, "cluster": cluster}),
         ("users", {"name": name, "user": user}),
@@ -111,13 +115,13 @@ def merge(
     # 남의 current-context 는 뺏지 않는다. 다만 그 이름이 가리키는 컨텍스트가
     # 실제로 없으면(지워졌거나 null) 가리키는 곳이 없는 것이므로 비어 있는
     # 것으로 본다 — 그대로 두면 kubectl 이 없는 컨텍스트를 계속 찾는다.
-    current = data.get("current-context")
-    names = {
-        entry.get("name")
-        for entry in data.get("contexts") or []
-        if isinstance(entry, dict)
-    }
-    if not current or current not in names:
+    # 남의 current-context 는 뺏지 않는다. 여기 없는 이름을 가리킨다고 해서
+    # 고아라고 단정할 수도 없다 — KUBECONFIG 로 파일 여러 개를 엮어 쓰면
+    # 컨텍스트 정의는 다른 파일에 있고 current-context 만 이 파일에 남는다.
+    # 그걸 고아로 오판해 덮어쓰면 운영 클러스터를 쓰던 사람의 기본값이
+    # 조용히 랩으로 바뀐다. 그래서 '이 파일에 컨텍스트가 하나도 없었을 때'
+    # 로만 한정한다 — 그때는 빼앗을 남의 것 자체가 없다.
+    if not data.get("current-context") or not had_contexts:
         data["current-context"] = name
 
     # '우리가 기본값이 됐나' 가 아니라 '결과적으로 우리가 기본값인가' 를

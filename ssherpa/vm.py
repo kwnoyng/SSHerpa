@@ -308,9 +308,15 @@ def _run_step(target: Target, step: Step) -> None:
         )
 
 
-def wait_for_ip(target: Target, name: str) -> tuple[str, str]:
+def wait_for_ip(
+    target: Target, name: str, timeout: int = IP_TIMEOUT
+) -> tuple[str, str]:
     """(mac, ip) 를 돌려준다. 가상 공유기의 임대 장부에 IP 가 올라올
-    때까지 기다린다 — 첫 부팅은 cloud-init 까지 1분 안팎이 걸린다."""
+    때까지 기다린다 — 첫 부팅은 cloud-init 까지 1분 안팎이 걸린다.
+
+    timeout=0 이면 한 번만 보고 만다. 상태를 '조회' 하는 쪽은 기다리면
+    안 된다 — status 가 주소 없는 VM 앞에서 3분간 멈춰 있었다 (실측).
+    """
     iflist = run(target, f"sudo virsh domiflist {name}", timeout=30)
     mac = parse_mac(iflist.stdout)
     if not mac:
@@ -320,16 +326,25 @@ def wait_for_ip(target: Target, name: str) -> tuple[str, str]:
              f"Inspect it on the host:  sudo virsh dumpxml {name}"],
         )
 
-    deadline = time.monotonic() + IP_TIMEOUT
-    while time.monotonic() < deadline:
+    deadline = time.monotonic() + timeout
+    while True:
         leases = run(target, "sudo virsh net-dhcp-leases default", timeout=30)
         ip = parse_lease_ip(leases.stdout, mac)
         if ip:
             return mac, ip
+        if time.monotonic() >= deadline:
+            break
         time.sleep(IP_POLL_INTERVAL)
 
+    # 기다리지 않기로 한 호출(조회 명령)에는 '시간이 모자랐다' 가 아니라
+    # '지금은 주소가 없다' 가 사실이다.
+    message = (
+        f"{name} has no address yet"
+        if timeout <= 0
+        else f"{name} did not obtain an IP within {timeout}s"
+    )
     raise VmError(
-        f"{name} did not obtain an IP within {IP_TIMEOUT}s",
+        message,
         [
             "The VM is defined but never reached the DHCP handshake.",
             "Watch it boot from the host console:",
@@ -607,11 +622,18 @@ def list_vms(target: Target) -> list[str]:
     )
 
 
-def find(target: Target, name: Optional[str] = None) -> Optional[VmInfo]:
+def find(
+    target: Target,
+    name: Optional[str] = None,
+    timeout: int = IP_TIMEOUT,
+) -> Optional[VmInfo]:
     """호스트의 SSHerpa VM 을 찾아 접속 정보(IP)까지 채운다. 없으면 None.
 
     이름을 주지 않으면 첫 번째(server) 노드를 고른다 — `ssherpa ssh --vm`
     처럼 "그 VM"이라고만 말했을 때 들어갈 곳이다.
+
+    timeout=0 은 '기다리지 말고 지금 상태만' 이라는 뜻이다. 조회 명령은
+    답을 만들어내려 기다리면 안 된다.
 
     켜져 있지 않으면 오류다 — IP 는 살아 있는 VM 만 갖는다.
     """
@@ -633,7 +655,7 @@ def find(target: Target, name: Optional[str] = None) -> Optional[VmInfo]:
             ],
         )
 
-    mac, ip = wait_for_ip(target, name)
+    mac, ip = wait_for_ip(target, name, timeout=timeout)
     return VmInfo(name=name, ip=ip, mac=mac, already_existed=True)
 
 

@@ -336,8 +336,19 @@ def doctor(
             _say()
         return
 
-    # 처방 속 자리표시자를 실제 타겟 이름으로 채운다
-    hints = [hint.replace("<target>", label) for hint in diagnosis.hints]
+    # 처방 속 자리표시자를 실제 타겟 이름으로 채운다. 일회성 --host 로
+    # 부른 경우엔 채울 이름이 없다 — 주소를 넣으면 up 이 받지 않는
+    # (등록되지 않은) 이름을 시키게 되므로, 등록부터 안내한다.
+    if target.name:
+        hints = [hint.replace("<target>", target.name) for hint in diagnosis.hints]
+    else:
+        hints = [hint.replace("<target>", "<name>") for hint in diagnosis.hints]
+        if any("ssherpa up" in hint for hint in hints):
+            hints += [
+                "",
+                "up works on registered targets, so register it first:",
+                f"    ssherpa target add <name> --host {target.host}",
+            ]
     _fail(diagnosis.failure, hints)
 
 
@@ -874,7 +885,9 @@ def status(
         unreachable = None
         if vms:
             try:
-                info = vm_mod.find(target)
+                # 기다리지 않는다. status 는 지금 상태를 말하는 명령이지
+                # 상태가 좋아지기를 기다리는 명령이 아니다.
+                info = vm_mod.find(target, timeout=0)
                 if info is not None:
                     inside = cluster.status(
                         cluster.Node(

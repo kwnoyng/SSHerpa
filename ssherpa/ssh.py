@@ -261,11 +261,17 @@ def _classify(stderr: str, target: Target) -> SSHError:
         )
 
     if "host key verification failed" in lower or "identification has changed" in lower:
+        # 어느 파일에 기록됐는지에 따라 고치는 명령이 다르다. 이 접속이
+        # 전용 known_hosts 를 쓰는데 기본 파일을 고치라고 안내하면,
+        # 시키는 대로 해도 아무것도 바뀌지 않는다 (실측).
+        forget = f"ssh-keygen -R {target.host}"
+        if target.known_hosts:
+            forget += f" -f {target.known_hosts}"
         return SSHError(
             "host key verification failed",
             [
                 "If you reinstalled the target, remove the old key:",
-                f"    ssh-keygen -R {target.host}",
+                f"    {forget}",
                 "If this change was unexpected, it could be a man-in-the-middle attack",
             ],
         )

@@ -317,3 +317,29 @@ class TestSshConfigRespect:
         monkeypatch.setattr(ssh, "_find_default_keys", lambda: ["/home/x/.ssh/id_ed25519"])
         err = ssh._classify("x: Permission denied (publickey).", TARGET)
         assert "local" not in "\n".join(err.hints)
+
+
+class TestHostKeyHintNamesTheRightFile:
+    """VM 키는 전용 파일에 산다. 기본 파일을 고치라고 안내하면 시키는
+    대로 해도 아무것도 바뀌지 않는다 (실측)."""
+
+    CHANGED = (
+        "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n"
+        "Host key verification failed."
+    )
+
+    def test_vm_hint_points_at_our_file(self):
+        vm_target = Target(
+            name="lab/ssherpa-node-1",
+            host="192.168.122.182",
+            user="ssherpa",
+            known_hosts="/home/me/.ssherpa/known_hosts",
+        )
+        err = ssh._classify(self.CHANGED, vm_target)
+        line = next(h for h in err.hints if "ssh-keygen -R" in h)
+        assert "-f /home/me/.ssherpa/known_hosts" in line
+
+    def test_plain_host_hint_stays_simple(self):
+        err = ssh._classify(self.CHANGED, TARGET)
+        line = next(h for h in err.hints if "ssh-keygen -R" in h)
+        assert "-f " not in line

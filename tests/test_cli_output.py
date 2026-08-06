@@ -602,3 +602,50 @@ class TestStatusSaysWhenItCouldNotLook:
         with cli.console.capture() as captured:
             cli.status("lab-01")
         assert "could not ask" not in captured.get()
+
+
+class TestDoctorHintsAreRunnable:
+    """doctor 는 일회성 --host 로도 부를 수 있는데, up 은 등록된 이름만
+    받는다. 주소를 그대로 끼워 넣으면 'target not found' 로 끝난다."""
+
+    def _diagnose(self, monkeypatch, hints):
+        from ssherpa import cli
+        from ssherpa.doctor import Diagnosis
+        from ssherpa.ssh import CommandResult
+
+        monkeypatch.setattr(cli, "run", lambda *_a, **_k: CommandResult(0, "", ""))
+        monkeypatch.setattr(cli.doctor_mod, "parse_probe", lambda _s: None)
+        monkeypatch.setattr(
+            cli.doctor_mod,
+            "diagnose",
+            lambda _f: Diagnosis(
+                rows=[], host_type="virtual machine (google)", capable=False,
+                failure="this host cannot create VMs", hints=hints,
+            ),
+        )
+        return cli
+
+    HINTS = ["Or use host mode as is:", "    ssherpa up <target>"]
+
+    def test_registered_target_is_named_directly(self, monkeypatch, tmp_path):
+        import typer
+
+        cli = self._diagnose(monkeypatch, self.HINTS)
+        inv = tmp_path / "inv.yml"
+        inv.write_text(
+            "all:\n  hosts:\n    lab-01:\n      ansible_host: 10.0.0.1\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("SSHERPA_INVENTORY", str(inv))
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit):
+            cli.doctor("lab-01", host=None, user=None, key=None, port=None)
+        assert "ssherpa up lab-01" in captured.get()
+
+    def test_one_off_host_is_told_to_register_first(self, monkeypatch):
+        import typer
+
+        cli = self._diagnose(monkeypatch, self.HINTS)
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit):
+            cli.doctor(None, host="10.0.0.10", user="admin", key=None, port=None)
+        out = captured.get()
+        assert "ssherpa up 10.0.0.10" not in out  # 등록된 적 없는 이름
+        assert "target add" in out
