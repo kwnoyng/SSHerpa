@@ -465,7 +465,9 @@ class TestUpHealOrchestration:
 
 
 class TestCountReady:
-    """'NotReady' 도 두 번째 칸에 온다 — 부분 문자열로 세면 안 된다."""
+    """STATUS 칸은 쉼표로 이어붙인 목록이다. 'NotReady' 도 여기 오므로 부분
+    문자열로 세면 안 되고, cordon 한 노드는 'Ready,SchedulingDisabled' 라
+    통째로 비교해도 안 된다."""
 
     OUTPUT = (
         "ssherpa-node-1   Ready      control-plane   5m    v1.36.2+k3s1\n"
@@ -478,6 +480,23 @@ class TestCountReady:
 
     def test_empty_output(self):
         assert cluster.count_ready("") == 0
+
+    def test_cordoned_node_is_still_ready(self):
+        # cordon 은 스케줄만 막는다 — 노드는 여전히 Ready 다. 이걸 못 세면
+        # 멀쩡한 클러스터에 up 을 다시 돌렸을 때 크기가 모자라 보인다.
+        output = (
+            "ssherpa-node-1   Ready                      control-plane   5m   v1\n"
+            "ssherpa-node-2   Ready,SchedulingDisabled   <none>          1m   v1\n"
+        )
+        assert cluster.count_ready(output) == 2
+
+    def test_drained_but_broken_node_is_not_ready(self):
+        # 첫 칸만 본다고 해서 NotReady 를 놓치면 안 된다
+        output = "ssherpa-node-2   NotReady,SchedulingDisabled   <none>   1m   v1\n"
+        assert cluster.count_ready(output) == 0
+
+    def test_header_line_is_not_a_node(self):
+        assert cluster.count_ready("NAME   STATUS   ROLES   AGE   VERSION\n") == 0
 
 
 class TestJoin:

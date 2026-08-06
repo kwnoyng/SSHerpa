@@ -459,6 +459,38 @@ class TestListVms:
         )
         assert vm.list_vms(TARGET) == []
 
+    def test_ten_nodes_are_not_ordered_as_text(self, monkeypatch):
+        # 문자열 정렬은 node-10 을 node-2 앞에 놓는다. 32GB 호스트의 용량이
+        # ~15대라 닿는 크기다.
+        out = "\n".join(f"ssherpa-node-{i}" for i in (1, 10, 11, 2, 3)) + "\n"
+        monkeypatch.setattr(
+            vm, "run", lambda *a, **k: CommandResult(0, out, "")  # noqa: ARG005
+        )
+        assert vm.list_vms(TARGET) == [
+            "ssherpa-node-1",
+            "ssherpa-node-2",
+            "ssherpa-node-3",
+            "ssherpa-node-10",
+            "ssherpa-node-11",
+        ]
+
+    def test_server_is_first_even_past_ten(self, monkeypatch):
+        # find() 는 이 순서를 그대로 믿고 첫 번째를 server 로 고른다
+        out = "ssherpa-node-12\nssherpa-node-1\n"
+        monkeypatch.setattr(
+            vm, "run", lambda *a, **k: CommandResult(0, out, "")  # noqa: ARG005
+        )
+        assert vm.list_vms(TARGET)[0] == "ssherpa-node-1"
+
+
+class TestNodeOrder:
+    def test_numbers_read_as_numbers(self):
+        assert vm.node_order("ssherpa-node-2") < vm.node_order("ssherpa-node-10")
+
+    def test_unnumbered_names_go_last(self):
+        # 우리 접두사가 붙었어도 node-N 이 아니면 server 후보가 아니다
+        assert vm.node_order("ssherpa-node-1") < vm.node_order("ssherpa-scratch")
+
 
 class TestVmTarget:
     """VM 을 여느 target 처럼 — 기존 부품 전부가 이 Target 으로 동작해야 한다."""

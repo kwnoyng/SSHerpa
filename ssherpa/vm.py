@@ -607,12 +607,31 @@ def unexpose_api(target: Target, reporter=None) -> None:
 
 _NO_VIRSH = "SSHERPA_NO_VIRSH"
 
+_TRAILING_NUMBER = re.compile(r"(\d+)$")
+
+
+def node_order(name: str) -> tuple[int, int, str]:
+    """이름 끝의 숫자를 숫자로 읽는 정렬 키.
+
+    문자열로 정렬하면 node-10 이 node-2 앞에 온다. 32GB 호스트의 용량이
+    ~15대라 열 대 넘는 클러스터는 닿는 크기다.
+
+    목록이 뒤섞여 보이는 것보다 중요한 건, 그렇게 두면 '첫 번째가 언제나
+    server(node-1)' 라는 약속이 우연에 기대게 된다는 점이다 — 지금 그 약속이
+    지켜지는 이유는 문자열 비교에서 짧은 쪽이 먼저 오기 때문일 뿐이다.
+
+    숫자가 없는 이름은 뒤로 보낸다. 우리 접두사가 붙었어도 node-N 이 아니면
+    server 후보가 아니다.
+    """
+    match = _TRAILING_NUMBER.search(name)
+    return (0, int(match.group(1)), name) if match else (1, 0, name)
+
 
 def list_vms(target: Target) -> list[str]:
     """호스트에 있는 SSHerpa 소유 VM 이름 목록.
 
     virsh 는 켜진 것을 먼저, 꺼진 것을 나중에 늘어놓는다. 그대로 쓰면
-    꺼진 노드 하나 때문에 목록 순서가 뒤집혀 읽기 어려우므로 이름순으로
+    꺼진 노드 하나 때문에 목록 순서가 뒤집혀 읽기 어려우므로 노드 번호순으로
     돌려준다 — 첫 번째가 언제나 server(node-1) 라는 약속도 여기 걸려 있다.
 
     virsh 가 없는 호스트(host 모드만 쓰는)는 빈 목록이다 — 오류가 아니다.
@@ -639,9 +658,12 @@ def list_vms(target: Target) -> list[str]:
             ],
         )
     return sorted(
-        line.strip()
-        for line in result.stdout.splitlines()
-        if line.strip().startswith(VM_PREFIX)
+        (
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip().startswith(VM_PREFIX)
+        ),
+        key=node_order,
     )
 
 
@@ -677,7 +699,9 @@ def find(
     if name is not None and name not in names:
         return None
 
-    name = name or sorted(names)[0]
+    # list_vms 가 이미 노드 번호순이다. 여기서 한 번 더 정렬하면 순서를
+    # 정하는 규칙이 두 곳이 되고, 한쪽만 바뀌면 조용히 어긋난다.
+    name = name or names[0]
     state = vm_state(target, name)
     if state != "running":
         label = target.name or "<target>"
