@@ -6,7 +6,10 @@ from ssherpa import cluster
 from ssherpa import distro as distro_mod
 from ssherpa.ssh import Target
 
-TARGET = Target(name="lab-01", host="34.50.34.61", user="ssherpa")
+# 주소는 RFC 5737 의 문서용 대역이다 — 라우팅되지 않으므로, 모킹을 빠뜨린
+# 테스트가 진짜 서버에 닿아 조용히 통과하는 일이 없다. 실제로 그렇게
+# 새어나간 적이 있다: 로컬에서는 키가 있어 통과하고 CI 에서만 깨졌다.
+TARGET = Target(name="lab-01", host="192.0.2.10", user="ssherpa")
 
 # k3s 가 실제로 만들어내는 kubeconfig 형태
 K3S_KUBECONFIG = """apiVersion: v1
@@ -370,6 +373,7 @@ class TestUpHealOrchestration:
         monkeypatch.setattr(cluster, "is_installed", lambda *_a: True)
         monkeypatch.setattr(cluster, "wait_for_ready", lambda *_a: None)
         monkeypatch.setattr(cluster, "api_reachable", lambda *_a, **_k: True)
+        monkeypatch.setattr(cluster, "config_is_ours", lambda *_a: True)
         monkeypatch.setattr(cluster, "fetch_kubeconfig", lambda *_a: fake_kubeconfig)
         monkeypatch.setattr(
             cluster.kubeconf,
