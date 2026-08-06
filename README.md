@@ -5,10 +5,10 @@
 
 Build Kubernetes labs on a single on-premises server, over nothing but SSH.
 
-> **v0.4** — register a host, check that it is ready, and stand up a
-> single-node Kubernetes cluster — directly on the host (k3s or RKE2), or
-> inside a VM on it (`up --vm`) — wired into your `~/.kube/config`.
-> Multi-VM clusters come next.
+> **v0.5** — register a host, check that it is ready, and stand up a
+> Kubernetes cluster on it: directly on the host (k3s or RKE2), or spread
+> over VMs on it (`up --vm --nodes 3`) — wired into your `~/.kube/config`.
+> One server, a real multi-node cluster.
 
 ## Requirements
 
@@ -212,8 +212,8 @@ Worth knowing:
 - **The VM's specs are fixed on purpose** — Ubuntu 24.04, 2 CPUs, 2 GB,
   a 10 GB thin disk, k3s inside. The host's OS is whatever you were given;
   the VM's OS is a part SSHerpa manufactures, so there is exactly one
-  combination to support and it is actually tested. Knobs (memory, disk,
-  node count) will open as needs prove themselves.
+  combination to support and it is actually tested. Remaining knobs (memory,
+  disk) will open as needs prove themselves.
 - **kubectl connects through the host's address.** The VM lives on a NAT
   network only the host can see, so the host forwards port 6443 inward —
   the same trick as port-forwarding on a home router.
@@ -234,6 +234,45 @@ Worth knowing:
   and your local kubeconfig entries.
 - VMs are standard libvirt guests named `ssherpa-*`. SSHerpa never touches
   a VM it did not create, and `virsh` can inspect everything it made.
+
+#### More than one node: `--nodes`
+
+```bash
+ssherpa up lab-01 --vm --nodes 3
+```
+
+A node is a machine, and a cluster is a group of them. One server therefore
+gives you a one-node cluster and nothing else — unless you make more machines
+on it, which is what this does: three VMs, one cluster, on hardware you have.
+
+The first VM becomes the control plane, the rest join it as workers, and the
+scheduler spreads work across all three for real — separate kernels, separate
+networks, not containers pretending to be nodes:
+
+```
+NAME             STATUS   ROLES           AGE   VERSION
+ssherpa-node-1   Ready    control-plane   63s   v1.36.3+k3s1
+ssherpa-node-2   Ready    <none>          45s   v1.36.3+k3s1
+ssherpa-node-3   Ready    <none>          26s   v1.36.3+k3s1
+```
+
+`--nodes` is refused before anything is built if the host cannot hold that
+many — half-built clusters leave you with VMs to clean up and no explanation.
+The limit is the same estimate `doctor` prints, so the advice and the outcome
+agree:
+
+```
+  this host fits about 7 VM(s), but 20 were asked for
+
+    Each node takes 2 GB, and the host keeps some for itself.
+    Try --nodes 7, or add memory to the host.
+    See the estimate:  ssherpa doctor lab-01
+```
+
+Re-running is safe here too: existing nodes are detected and left alone, and
+only missing ones are built and joined. `down` removes the whole cluster —
+every VM, the forwarding rule, and your local kubeconfig entries — without
+being told how many there were.
 
 ### 3. Use the cluster
 
@@ -256,7 +295,9 @@ kubectl --context ssherpa-lab-01 get nodes
 
 `down` removes exactly these entries again. A standalone copy also lives at
 `~/.ssherpa/kubeconfig/<target>.yaml` for anything that wants an isolated
-file.
+file. Both it and the backup SSHerpa keeps of your original
+(`~/.kube/config.ssherpa-backup`, written once, before the first merge) are
+created readable only by you — they hold cluster credentials.
 
 If port 6443 is not reachable (a cloud firewall, for instance), `up` says so
 and shows the safe alternative — an SSH tunnel:
@@ -284,6 +325,23 @@ ssherpa status lab-01
   node:  lab-01   Ready   control-plane   5m   v1.36.2+k3s1
 ```
 
+It asks the host rather than remembering, so a VM cluster is reported as one —
+saying "not installed" while three nodes hum along inside would be a lie the
+host itself could have corrected:
+
+```
+  Status of lab-01
+
+  k3s   —  not installed on the host
+  rke2  —  not installed on the host
+
+  vm:  ssherpa-node-1  running
+       ssherpa-node-2  running
+       ssherpa-node-3  running
+
+  cluster:  k3s in the VMs  3/3 nodes Ready
+```
+
 ```bash
 ssherpa down lab-01
 ```
@@ -297,10 +355,15 @@ is deleted and the `ssherpa-<target>` entries are removed from
 
 **Scripts must pass `--yes`.** Where there is no terminal to ask on — CI, a
 pipe, a redirect — SSHerpa refuses to destroy anything rather than read
-"could not ask" as consent, and exits 1 saying so. `up` is the opposite:
+"could not ask" as consent, and exits 1 saying so. The same holds when a
+terminal exists but the prompt cannot be drawn. `up` is the opposite:
 re-running it changes nothing that cannot be changed back, so it goes ahead
 unattended. A host with nothing on it needs no `--yes` either; `down` says so
 and exits 0, which keeps clean-up scripts simple.
+
+`down` also sweeps a forwarding rule left behind by VMs that were removed by
+hand, so a host cleaned up with `virsh` does not keep re-installing a route to
+an address that no longer exists.
 
 ### 5. Jump onto the host — or into the VM
 
@@ -325,7 +388,7 @@ Extra arguments are passed straight to `ssh`.
 | `ssherpa target remove <NAME>` | no |
 | `ssherpa check <NAME>` (or `--host` for one-off) | yes |
 | `ssherpa doctor <NAME>` (or `--host` for one-off) | yes |
-| `ssherpa up <NAME> [--distro k3s\|rke2] [--vm] [--yes]` | yes |
+| `ssherpa up <NAME> [--distro k3s\|rke2] [--vm] [--nodes N] [--yes]` | yes |
 | `ssherpa status <NAME>` | yes |
 | `ssherpa down <NAME> [--yes]` | yes |
 | `ssherpa ssh <NAME> [--vm] [ssh args...]` | yes |
