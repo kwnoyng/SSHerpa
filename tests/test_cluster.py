@@ -83,6 +83,48 @@ class TestInstallSteps:
             assert step.label.strip()
 
 
+class TestAgentJoinSteps:
+    """합류 절차는 배포판마다 문·포트가 다르다."""
+
+    @pytest.mark.parametrize("name", ["k3s", "rke2"])
+    def test_token_and_server_address_are_carried(self, name):
+        steps = distro_mod.get(name).agent_install_steps("10.0.0.1", "sekret")
+        joined = "\n".join(s.command for s in steps)
+        assert "10.0.0.1" in joined
+        assert "sekret" in joined
+
+    def test_k3s_joins_through_the_api_port(self):
+        command = distro_mod.get("k3s").agent_install_steps("10.0.0.1", "t")[0].command
+        assert "K3S_URL=https://10.0.0.1:6443" in command
+        assert "K3S_TOKEN=" in command
+
+    def test_rke2_joins_through_the_supervisor_port(self):
+        # 9345 다. 6443 으로 보내면 붙는 듯하다 조용히 실패한다.
+        joined = "\n".join(
+            s.command for s in distro_mod.get("rke2").agent_install_steps("10.0.0.1", "t")
+        )
+        assert "9345" in joined
+        assert "https://10.0.0.1:6443" not in joined
+
+    def test_rke2_installs_as_agent_not_server(self):
+        joined = "\n".join(
+            s.command for s in distro_mod.get("rke2").agent_install_steps("h", "t")
+        )
+        assert "INSTALL_RKE2_TYPE=agent" in joined
+        assert "rke2-agent" in joined
+
+    @pytest.mark.parametrize("name", ["k3s", "rke2"])
+    def test_token_is_read_as_root(self, name):
+        chosen = distro_mod.get(name)
+        assert chosen.read_token_command().startswith("sudo ")
+        assert chosen.token_path in chosen.read_token_command()
+
+    @pytest.mark.parametrize("name", ["k3s", "rke2"])
+    def test_joining_allows_more_time_than_default(self, name):
+        steps = distro_mod.get(name).agent_install_steps("h", "t")
+        assert max(s.timeout for s in steps) >= 300
+
+
 class TestDistroPaths:
     @pytest.mark.parametrize("name", ["k3s", "rke2"])
     def test_uninstall_tolerates_missing_script(self, name):
@@ -418,6 +460,157 @@ class TestUpHealOrchestration:
         }
 
 
+class TestCountReady:
+    """'NotReady' 도 두 번째 칸에 온다 — 부분 문자열로 세면 안 된다."""
+
+    OUTPUT = (
+        "ssherpa-node-1   Ready      control-plane   5m    v1.36.2+k3s1\n"
+        "ssherpa-node-2   Ready      <none>          1m    v1.36.2+k3s1\n"
+        "ssherpa-node-3   NotReady   <none>          10s   v1.36.2+k3s1\n"
+    )
+
+    def test_counts_only_ready(self):
+        assert cluster.count_ready(self.OUTPUT) == 2
+
+    def test_empty_output(self):
+        assert cluster.count_ready("") == 0
+
+
+class TestJoin:
+    """agent 는 server 가 발급한 토큰으로만 들어올 수 있다."""
+
+    def _nodes(self, count):
+        return [
+            cluster.Node(
+                name=f"n{i}",
+                target=Target(name=None, host=f"192.168.122.{10 + i}", user="ssherpa"),
+                role="server" if i == 1 else "agent",
+            )
+            for i in range(1, count + 1)
+        ]
+
+    def test_token_is_read_from_the_server(self, monkeypatch):
+        seen = {}
+
+        def fake_run(target, command, timeout=30):  # noqa: ARG001
+            seen["host"] = target.host
+            return cluster.CommandResult(0, "K10abc::server:secret\n", "")
+
+        monkeypatch.setattr(cluster, "run", fake_run)
+        nodes = self._nodes(2)
+        token = cluster.read_token(nodes[0], distro_mod.get("k3s"))
+        assert token == "K10abc::server:secret"
+        assert seen["host"] == "192.168.122.11"  # agent 가 아니라 server 에게 묻는다
+
+    def test_missing_token_is_not_silently_empty(self, monkeypatch):
+        # 빈 토큰으로 합류를 시도하면 agent 가 알 수 없는 이유로 실패한다
+        monkeypatch.setattr(
+            cluster, "run", lambda *a, **k: cluster.CommandResult(0, "\n", "")  # noqa: ARG005
+        )
+        with pytest.raises(cluster.ClusterError, match="join token"):
+            cluster.read_token(self._nodes(1)[0], distro_mod.get("k3s"))
+
+    def test_agents_are_pointed_at_the_server_node_address(self, monkeypatch):
+        # 밖에서 닿는 주소가 아니라 노드 주소로 붙어야 한다 — NAT 안에서는
+        # 호스트 주소로 자기 자신을 찾아갈 수 없다.
+        commands = []
+        monkeypatch.setattr(
+            cluster, "run", lambda *a, **k: cluster.CommandResult(0, "tok\n", "")  # noqa: ARG005
+        )
+        monkeypatch.setattr(
+            cluster, "_run_step", lambda _n, step: commands.append(step.command)
+        )
+        nodes = self._nodes(3)
+        cluster.join_agents(nodes[0], nodes[1:], distro_mod.get("k3s"))
+        assert len(commands) == 2  # agent 두 대
+        assert all("https://192.168.122.11:6443" in c for c in commands)
+        assert all("K3S_TOKEN='tok'" in c for c in commands)
+
+
+class TestUpWithAgents:
+    """멀티노드: server 를 세우고, 토큰을 읽고, 나머지를 합류시킨다."""
+
+    def _wire(self, monkeypatch, tmp_path, installed):
+        calls = {"steps": [], "waits": []}
+        kc = tmp_path / "kc.yaml"
+        kc.write_text("apiVersion: v1\n")
+
+        monkeypatch.setattr(cluster, "is_installed", lambda node, _d: installed[node.name])
+        monkeypatch.setattr(cluster, "api_reachable", lambda *_a, **_k: True)
+        monkeypatch.setattr(cluster, "fetch_kubeconfig", lambda *_a: kc)
+        monkeypatch.setattr(cluster, "certificate_covers", lambda *_a: True)
+        monkeypatch.setattr(
+            cluster.kubeconf,
+            "merge",
+            lambda *_a, **_k: cluster.kubeconf.MergeResult(
+                context="c", became_current=True, backup=None
+            ),
+        )
+        monkeypatch.setattr(
+            cluster,
+            "wait_for_ready",
+            lambda _n, _d, expected=1: calls["waits"].append(expected),
+        )
+        monkeypatch.setattr(
+            cluster, "run", lambda *a, **k: cluster.CommandResult(0, "tok\n", "")  # noqa: ARG005
+        )
+        monkeypatch.setattr(
+            cluster, "_run_step", lambda node, step: calls["steps"].append(
+                (node.name, step.label)
+            )
+        )
+        return calls
+
+    def _nodes(self):
+        return [
+            cluster.Node(
+                name=f"n{i}",
+                target=Target(name=None, host=f"10.0.0.{i}", user="u"),
+                role="server" if i == 1 else "agent",
+            )
+            for i in (1, 2, 3)
+        ]
+
+    def test_waits_for_every_node(self, monkeypatch, tmp_path):
+        nodes = self._nodes()
+        calls = self._wire(
+            monkeypatch, tmp_path, {"n1": False, "n2": False, "n3": False}
+        )
+        result = cluster.up(
+            nodes[0], distro_mod.get("k3s"), agents=nodes[1:], api_address="1.2.3.4"
+        )
+        # server 혼자 Ready 를 먼저 확인하고, 합류 뒤 전체를 다시 확인한다
+        assert calls["waits"] == [1, 3]
+        assert result.node_count == 3
+
+    def test_agents_install_after_the_server(self, monkeypatch, tmp_path):
+        nodes = self._nodes()
+        calls = self._wire(
+            monkeypatch, tmp_path, {"n1": False, "n2": False, "n3": False}
+        )
+        cluster.up(nodes[0], distro_mod.get("k3s"), agents=nodes[1:])
+        who = [name for name, _label in calls["steps"]]
+        assert who.index("n1") < who.index("n2")
+        assert {"n2", "n3"} <= set(who)
+
+    def test_already_joined_agents_are_left_alone(self, monkeypatch, tmp_path):
+        # 재실행이 안전해야 한다 — 이미 붙어 있는 노드를 다시 설치하지 않는다
+        nodes = self._nodes()
+        calls = self._wire(
+            monkeypatch, tmp_path, {"n1": True, "n2": True, "n3": True}
+        )
+        cluster.up(nodes[0], distro_mod.get("k3s"), agents=nodes[1:])
+        assert calls["steps"] == []
+        assert calls["waits"] == [1, 3]
+
+    def test_single_node_behaves_as_before(self, monkeypatch, tmp_path):
+        nodes = self._nodes()
+        calls = self._wire(monkeypatch, tmp_path, {"n1": True})
+        result = cluster.up(nodes[0], distro_mod.get("k3s"))
+        assert calls["waits"] == [1]  # 전체 대기 단계가 없다
+        assert result.node_count == 1
+
+
 class TestRewriteKubeconfig:
     """127.0.0.1 그대로 두면 내 PC 에서 kubectl 이 자기 자신에게 접속한다."""
 
@@ -448,3 +641,41 @@ class TestKubeconfigPath:
 
     def test_lives_under_ssherpa_home(self):
         assert ".ssherpa" in str(cluster.kubeconfig_path("lab-01"))
+
+
+class TestStepLabels:
+    """어느 노드의 일인지 보이지 않으면 이미 있는 노드까지 새로 만드는
+    것처럼 읽힌다 — 실사용에서 실제로 그렇게 오해됐다."""
+
+    def test_short_name_is_used_when_given(self):
+        node = cluster.Node(
+            name="gcp-lab-node-2", target=TARGET, short_name="node-2"
+        )
+        assert node.label() == "node-2"
+
+    def test_falls_back_to_the_full_name(self):
+        assert cluster.Node(name="lab-01", target=TARGET).label() == "lab-01"
+
+    def test_join_steps_say_which_node(self, monkeypatch):
+        labels = []
+
+        class Reporter:
+            def step(self, label):
+                labels.append(label)
+                from contextlib import nullcontext
+
+                return nullcontext()
+
+        monkeypatch.setattr(
+            cluster, "run", lambda *a, **k: cluster.CommandResult(0, "tok\n", "")  # noqa: ARG005
+        )
+        monkeypatch.setattr(cluster, "_run_step", lambda *_a: None)
+        agents = [
+            cluster.Node(name="lab-node-2", target=TARGET, short_name="node-2"),
+            cluster.Node(name="lab-node-3", target=TARGET, short_name="node-3"),
+        ]
+        server = cluster.Node(name="lab-node-1", target=TARGET, short_name="node-1")
+        cluster.join_agents(server, agents, distro_mod.get("k3s"), Reporter())
+
+        assert any(label.startswith("node-2: ") for label in labels)
+        assert any(label.startswith("node-3: ") for label in labels)

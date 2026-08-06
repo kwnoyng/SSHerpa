@@ -44,6 +44,7 @@ class Target:
     port: Optional[int] = None
     key: Optional[str] = None
     jump: Optional[str] = None  # -J 에 넘길 경유지 (user@host[:port])
+    known_hosts: Optional[str] = None  # 이 접속에만 쓸 known_hosts 파일
 
     def destination(self) -> str:
         """ssh 에 넘길 목적지. user 미지정이면 host 만 (config 가 정함)."""
@@ -102,6 +103,8 @@ def _build_command(target: Target, remote_command: str) -> list[str]:
         argv += ["-i", os.path.expanduser(target.key)]
     if target.jump:
         argv += ["-J", target.jump]
+    if target.known_hosts:
+        argv += ["-o", f"UserKnownHostsFile={os.path.expanduser(target.known_hosts)}"]
     # '--' 뒤로는 ssh 가 옵션을 찾지 않는다. 목적지가 '-' 로 시작하면
     # (예: '-oProxyCommand=...') ssh 는 그것을 옵션으로 읽어 실행해 버린다.
     # 여기서는 목적지 다음이 항상 우리가 만든 원격 명령이라 '--' 를 넣어도

@@ -214,6 +214,7 @@ class TestStatusSurvivesALostConnection:
         )
         monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: ["ssherpa-node-1"])
         monkeypatch.setattr(cli.vm_mod, "vm_state", vm_state)
+        monkeypatch.setattr(cli.vm_mod, "find", lambda *_a, **_k: None)
 
     def test_lost_connection_becomes_a_readable_failure(self, monkeypatch):
         import typer
@@ -229,6 +230,22 @@ class TestStatusSurvivesALostConnection:
             cli.status("lab-01")
         assert caught.value.exit_code == 1
         assert "connection refused" in captured.get()
+
+    def test_unreachable_vm_does_not_sink_the_report(self, monkeypatch):
+        # 꺼진 VM 이나 안 뜬 k3s 때문에 status 가 실패하면, 정작 상태를
+        # 알아야 할 때 아무것도 못 듣는다. 호스트 접속은 이미 성공했다.
+        from ssherpa import cli
+        from ssherpa.vm import VmError
+
+        self._wire(monkeypatch, lambda *_a, **_k: "shut off")
+
+        def not_running(*_a, **_k):
+            raise VmError("ssherpa-node-1 is not running (shut off)")
+
+        monkeypatch.setattr(cli.vm_mod, "find", not_running)
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        assert "ssherpa-node-1" in captured.get()
 
     def test_healthy_host_still_reports_the_vm(self, monkeypatch):
         from ssherpa import cli
@@ -334,3 +351,254 @@ class TestExitCodes:
     def test_target_commands_do_not_crash(self, args, tmp_path):
         result = run_cli(args, inventory=tmp_path / "inv.yml")
         assert "Traceback" not in result.stderr
+
+
+class TestNodesFlag:
+    """노드는 기계다. 기계가 하나뿐인 곳에 노드를 더 달라고 할 수는 없다."""
+
+    def _wire(self, monkeypatch):
+        from ssherpa import cli
+        from ssherpa.ssh import Target
+
+        target = Target(name="lab-01", host="10.0.0.1")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        # 이 지점보다 뒤로는 가지 않아야 한다 — 접속이 일어나면 실패다
+        monkeypatch.setattr(
+            cli, "_installed_on", lambda _n: pytest.fail("touched the host")
+        )
+        return cli
+
+    def test_nodes_without_vm_is_refused(self, monkeypatch):
+        import typer
+
+        cli = self._wire(monkeypatch)
+        with pytest.raises(typer.Exit) as caught:
+            cli.up("lab-01", distro=None, vm_mode=False, nodes=3, assume_yes=True)
+        assert caught.value.exit_code == 1
+
+    def test_refusal_shows_the_command_that_works(self, monkeypatch):
+        import typer
+
+        cli = self._wire(monkeypatch)
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit):
+            cli.up("lab-01", distro=None, vm_mode=False, nodes=3, assume_yes=True)
+        assert "--vm --nodes 3" in captured.get()
+
+    def test_zero_nodes_is_refused(self, monkeypatch):
+        import typer
+
+        cli = self._wire(monkeypatch)
+        with pytest.raises(typer.Exit):
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=0, assume_yes=True)
+
+
+class TestNodeCapacity:
+    """만들다 메모리가 떨어지면 지워야 할 VM 몇 대와 이유 모를 실패만 남는다.
+
+    doctor 가 보여주는 것과 같은 계산으로, 만들기 전에 거절해야 한다.
+    """
+
+    def _wire(self, monkeypatch, capacity):
+        from ssherpa import cli, virt
+        from ssherpa.ssh import Target
+
+        target = Target(name="lab-01", host="10.0.0.1")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: [])
+        monkeypatch.setattr(
+            cli.virt,
+            "setup",
+            lambda *_a, **_k: virt.SetupResult(
+                already_installed=True, virsh_version="10.0.0", vm_capacity=capacity
+            ),
+        )
+        def built(*_a, **_k):
+            # pytest.fail 은 BaseException 이라 '여기까지 왔는지'를
+            # 검사하는 쪽에서 잡을 수 없다. 평범한 예외를 표식으로 쓴다.
+            raise RuntimeError("built a VM anyway")
+
+        monkeypatch.setattr(cli.vm_mod, "create", built)
+        return cli
+
+    def test_too_many_nodes_refused_before_building(self, monkeypatch):
+        import typer
+
+        cli = self._wire(monkeypatch, capacity=3)
+        with pytest.raises(typer.Exit) as caught:
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=5, assume_yes=True)
+        assert caught.value.exit_code == 1
+
+    def test_refusal_names_both_numbers(self, monkeypatch):
+        import typer
+
+        cli = self._wire(monkeypatch, capacity=3)
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit):
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=5, assume_yes=True)
+        out = captured.get()
+        assert "3" in out and "5" in out
+        assert "doctor" in out
+
+    def test_unknown_capacity_does_not_block(self, monkeypatch):
+        # 메모리를 못 읽었다고 해서 막으면, 읽기 실패가 곧 사용 불가가 된다
+        import typer
+
+        cli = self._wire(monkeypatch, capacity=None)
+        with pytest.raises((typer.Exit, Exception)) as caught:
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=5, assume_yes=True)
+        # create 까지 갔다는 뜻 — pytest.fail 이 잡힌다
+        assert "built a VM anyway" in str(caught.value)
+
+
+class TestExistingClusterSize:
+    """'몇 대인지 말하지 않았다' 와 '한 대라고 말했다' 는 다른 요청이다.
+
+    실측: 3노드가 도는 호스트에서 `up --vm` 이 'Cluster ready' 를 1노드처럼
+    출력했다. 기본값 1 을 요청으로 단정했기 때문이다.
+    """
+
+    def _wire(self, monkeypatch, existing):
+        from ssherpa import cli, virt
+        from ssherpa.ssh import Target
+
+        target = Target(name="lab-01", host="10.0.0.1")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: existing)
+        monkeypatch.setattr(
+            cli.virt,
+            "setup",
+            lambda *_a, **_k: virt.SetupResult(
+                already_installed=True, virsh_version="10.0.0", vm_capacity=7
+            ),
+        )
+
+        built = []
+
+        def create(_t, *, spec, reporter=None):  # noqa: ARG001
+            built.append(spec.name)
+            raise RuntimeError("stop here")
+
+        monkeypatch.setattr(cli.vm_mod, "create", create)
+        return cli, built
+
+    def test_no_flag_adopts_the_existing_size(self, monkeypatch):
+        # 3대가 있으면 3노드로 다룬다 — 1노드라고 보고하지 않는다
+        cli, built = self._wire(
+            monkeypatch, ["ssherpa-node-1", "ssherpa-node-2", "ssherpa-node-3"]
+        )
+        with cli.console.capture() as captured, pytest.raises(RuntimeError):
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=None, assume_yes=True)
+        assert "3 VMs" in captured.get()
+
+    def test_no_flag_on_an_empty_host_means_one(self, monkeypatch):
+        cli, built = self._wire(monkeypatch, [])
+        with cli.console.capture() as captured, pytest.raises(RuntimeError):
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=None, assume_yes=True)
+        assert "a VM" in captured.get()
+        assert built == ["ssherpa-node-1"]
+
+    def test_asking_for_fewer_is_refused(self, monkeypatch):
+        import typer
+
+        cli, built = self._wire(
+            monkeypatch, ["ssherpa-node-1", "ssherpa-node-2", "ssherpa-node-3"]
+        )
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit):
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=1, assume_yes=True)
+        out = captured.get()
+        assert "3 nodes already exist" in out
+        assert "down lab-01" in out  # 줄이려면 걷어내고 다시 세운다
+        assert built == []  # 아무것도 만들지 않았다
+
+    def test_asking_for_more_grows(self, monkeypatch):
+        # 늘리는 것은 파괴가 아니라 추가다 — 새 노드만 만들어 합류시킨다
+        cli, built = self._wire(monkeypatch, ["ssherpa-node-1"])
+        with pytest.raises(RuntimeError):
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=3, assume_yes=True)
+        assert built == ["ssherpa-node-1"]  # create 가 첫 노드에서 멈춘다
+
+
+class TestLocalTracesAreRemoved:
+    """down 이 로컬 흔적을 남기면 죽은 클러스터를 가리키는 컨텍스트가 쌓인다.
+
+    실측: 멀티노드로 이름 규칙이 바뀌었는데 down 만 옛 이름을 지우고 있어서,
+    5노드를 걷어낸 뒤에도 kubeconfig 파일과 컨텍스트가 살아남았다.
+    """
+
+    def test_up_and_down_agree_on_the_name(self):
+        # 두 곳이 각자 이름을 지으면 다시 어긋난다 — 한 함수만 쓴다
+        from ssherpa import vm
+
+        assert vm.node_label("gcp-lab", "ssherpa-node-1") == "gcp-lab-node-1"
+
+    def test_down_removes_every_node_entry(self, monkeypatch, tmp_path):
+        from ssherpa import cli
+        from ssherpa.ssh import Target
+
+        vms = ["ssherpa-node-1", "ssherpa-node-2"]
+        target = Target(name="lab-01", host="10.0.0.1")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: vms)
+        monkeypatch.setattr(cli.vm_mod, "destroy", lambda *_a, **_k: True)
+        monkeypatch.setattr(cli.vm_mod, "unexpose_api", lambda *_a, **_k: None)
+        monkeypatch.setattr(cli.cluster, "kubeconfig_dir", lambda: tmp_path)
+
+        removed = []
+        monkeypatch.setattr(cli.kubeconf, "remove", lambda entry: removed.append(entry))
+
+        for entry in ("lab-01-node-1", "lab-01-node-2"):
+            (tmp_path / f"{entry}.yaml").write_text("apiVersion: v1\n")
+
+        cli.down("lab-01", assume_yes=True)
+
+        assert removed == ["lab-01-node-1", "lab-01-node-2"]
+        assert list(tmp_path.glob("*.yaml")) == []
+
+
+class TestStatusSaysWhenItCouldNotLook:
+    """못 물어봤다는 사실 자체가 보고할 내용이다.
+
+    실측: server 노드가 꺼져 있으면 클러스터에 대해 아무 줄도 나오지 않아,
+    침묵이 '클러스터가 없다' 로 읽혔다.
+    """
+
+    def _wire(self, monkeypatch, find):
+        from ssherpa import cli
+        from ssherpa.cluster import DistroStatus, HostStatus
+        from ssherpa.ssh import Target
+
+        target = Target(name="lab-01", host="10.0.0.1")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        monkeypatch.setattr(
+            cli.cluster,
+            "status",
+            lambda *_a, **_k: HostStatus(
+                distros=[DistroStatus("k3s", installed=False, service_state="")]
+            ),
+        )
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: ["ssherpa-node-1"])
+        monkeypatch.setattr(cli.vm_mod, "vm_state", lambda *_a, **_k: "shut off")
+        monkeypatch.setattr(cli.vm_mod, "find", find)
+        return cli
+
+    def test_reports_why_it_could_not_check(self, monkeypatch):
+        from ssherpa.vm import VmError
+
+        def stopped(*_a, **_k):
+            raise VmError("ssherpa-node-1 is not running (shut off)")
+
+        cli = self._wire(monkeypatch, stopped)
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "could not ask" in out
+        assert "not running" in out
+
+    def test_stays_quiet_when_there_is_nothing_to_say(self, monkeypatch):
+        # 물어봤는데 VM 이 없더라 — 그건 보고할 실패가 아니다
+        cli = self._wire(monkeypatch, lambda *_a, **_k: None)
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        assert "could not ask" not in captured.get()

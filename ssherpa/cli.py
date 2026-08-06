@@ -146,6 +146,21 @@ def _resolve_target(
     return Target(name=None, host=host, user=user, port=port, key=key)
 
 
+class _NodeReporter:
+    """단계 이름 앞에 어느 노드의 일인지 붙인다.
+
+    여러 노드를 다룰 때 'preflight / wait for ip' 같은 단계가 이름 없이
+    반복되면, 이미 있는 노드까지 새로 만드는 것처럼 읽힌다 (실사용 오해).
+    """
+
+    def __init__(self, inner, prefix: str):
+        self.inner = inner
+        self.prefix = prefix
+
+    def step(self, label: str):
+        return self.inner.step(f"{self.prefix}: {label}")
+
+
 class StepReporter:
     """단계별 진행 표시.
 
@@ -170,7 +185,8 @@ class StepReporter:
             raise
         elapsed = time.monotonic() - started
         self.console.print(
-            Padding(f"[green]✓[/green] {label:<22}[dim]{elapsed:6.1f}s[/dim]", (0, 0, 0, 4))
+            # 멀티노드에서는 'node-3: write cloud-init seed' 처럼 길어진다
+            Padding(f"[green]✓[/green] {label:<30}[dim]{elapsed:6.1f}s[/dim]", (0, 0, 0, 4))
         )
 
 
@@ -549,7 +565,10 @@ def _print_up_result(result, distro_name: str, target: Target) -> None:
             "[yellow]The host address changed since install — the certificate "
             "was refreshed to match.[/yellow]"
         )
-    _say("[bold green]Cluster ready[/bold green]")
+    if result.node_count > 1:
+        _say(f"[bold green]Cluster ready — {result.node_count} nodes[/bold green]")
+    else:
+        _say("[bold green]Cluster ready[/bold green]")
     _say(f"[dim]kubeconfig: {result.kubeconfig}[/dim]")
     _say()
 
@@ -600,12 +619,23 @@ def _print_up_result(result, distro_name: str, target: Target) -> None:
     _say()
 
 
-def _up_vm(name: str, target: Target, requested: Optional[str]) -> None:
+def _up_vm(
+    name: str, target: Target, requested: Optional[str], nodes: Optional[int]
+) -> None:
     """vm 모드: 호스트 위에 VM 을 만들고 그 안에 쿠버네티스를 올린다.
 
     사용자는 libvirt/cloud-init/포트포워딩의 존재를 몰라도 된다 —
     기반 준비부터 kubectl 연결까지가 이 한 번의 호출이다.
+
+    nodes 가 2 이상이면 VM 을 그만큼 만들어 하나의 클러스터로 묶는다.
+    첫 번째가 server, 나머지는 거기에 합류하는 agent 다.
+
+    nodes 가 None 이면 '몇 대인지 말하지 않았다'는 뜻이다 — 이미 있는
+    클러스터의 크기를 그대로 따른다. 1 로 단정하면 3노드가 도는 호스트에서
+    '1노드 준비됨' 이라고 보고하게 된다 (실측).
     """
+    if nodes is not None and nodes < 1:
+        _fail("--nodes must be at least 1")
     # 호스트에 직접 설치된 클러스터와는 공존할 수 없다. kubectl 이 쓸 6443 을
     # 호스트 모드는 자신이 듣고, vm 모드는 VM 으로 넘겨야 하기 때문이다.
     node_host = cluster.nodes_for_host_mode(target)[0]
@@ -632,10 +662,35 @@ def _up_vm(name: str, target: Target, requested: Optional[str]) -> None:
         )
     chosen = _resolve_distro("k3s")
 
+    # 이미 몇 대가 있는지는 호스트에게 묻는다. 저장해두지 않는 이유는
+    # 늘 같다 — 파일과 현실이 어긋날 수 있으니까.
+    with _surface_errors():
+        existing = vm_mod.list_vms(target)
+
+    if nodes is None:
+        # 말하지 않았으면 있는 그대로 — 없으면 한 대.
+        nodes = max(1, len(existing))
+    elif len(existing) > nodes:
+        # 줄이는 건 VM 을 지우는 일이라 조용히 하면 안 된다. 그렇다고
+        # 요청보다 많은 채로 '준비됨' 이라고 할 수도 없다.
+        _fail(
+            f"{len(existing)} nodes already exist here, but "
+            f"{nodes} {'was' if nodes == 1 else 'were'} asked for",
+            [
+                "SSHerpa does not shrink a cluster — removing nodes destroys them.",
+                "Take it down and build the size you want:",
+                f"    ssherpa down {name}",
+                f"    ssherpa up {name} --vm --nodes {nodes}",
+                "",
+                f"Or omit --nodes to keep the {len(existing)} that are there.",
+            ],
+        )
+
     console.print()
+    where = "a VM" if nodes == 1 else f"{nodes} VMs"
     console.print(
         Padding(
-            f"Installing [bold]{chosen.name}[/bold] on a VM on [bold]{name}[/bold]",
+            f"Installing [bold]{chosen.name}[/bold] on {where} on [bold]{name}[/bold]",
             (0, 0, 0, 2),
         )
     )
@@ -643,20 +698,52 @@ def _up_vm(name: str, target: Target, requested: Optional[str]) -> None:
 
     reporter = StepReporter(console)
     with _surface_errors():
-        virt.setup(target, reporter)
-        info = vm_mod.create(target, reporter=reporter)
-        vm_mod.expose_api(target, info.ip, reporter)
-        vm_node = cluster.Node(
-            name=f"{name}-vm",
-            target=vm_mod.vm_target(target, info),
-            # 오류 힌트가 안내할 이름은 VM 의 합성 이름이 아니라 사용자가
-            # 등록한 타겟이다 — 그리고 그 안으로 들어가려면 --vm 이 필요하다.
-            cli_name=name,
-            in_vm=True,
-        )
+        foundation = virt.setup(target, reporter)
+
+        # 만들기 전에 거절한다. 절반쯤 만들다 메모리가 떨어지면 사용자에게는
+        # 지워야 할 VM 몇 대와 이유 모를 실패만 남는다. doctor 가 보여주는
+        # 것과 같은 계산이라 안내와 결과가 어긋나지 않는다.
+        capacity = foundation.vm_capacity
+        if capacity is not None and nodes > capacity:
+            _fail(
+                f"this host fits about {capacity} VM(s), but {nodes} were asked for",
+                [
+                    f"Each node takes {vm_mod.PER_VM_MB // 1024} GB, and the host "
+                    "keeps some for itself.",
+                    f"Try --nodes {capacity}, or add memory to the host.",
+                    f"See the estimate:  ssherpa doctor {name}",
+                ],
+            )
+
+        def build(spec, role):
+            short = spec.name.removeprefix(vm_mod.VM_PREFIX)
+            # 한 대뿐이면 어느 노드인지 물을 일이 없다 — 이름표는 붙이지 않는다.
+            step_reporter = reporter if nodes == 1 else _NodeReporter(reporter, short)
+            info = vm_mod.create(target, spec=spec, reporter=step_reporter)
+            return info, cluster.Node(
+                name=vm_mod.node_label(name, spec.name),
+                target=vm_mod.vm_target(target, info),
+                role=role,
+                # 오류 힌트가 안내할 이름은 VM 의 합성 이름이 아니라 사용자가
+                # 등록한 타겟이다 — 그리고 그 안으로 들어가려면 --vm 이 필요하다.
+                cli_name=name,
+                in_vm=True,
+                short_name=short,
+            )
+
+        specs = vm_mod.specs_for(nodes)
+        server_info, server = build(specs[0], "server")
+        agents = [build(spec, "agent")[1] for spec in specs[1:]]
+
+        # 바깥에서 들어오는 길은 server 로만 낸다 — kubectl 이 말을 거는
+        # API 서버가 거기에만 있다.
+        vm_mod.expose_api(target, server_info.ip, reporter)
+
         # 인증서와 kubeconfig 에는 밖에서 닿는 주소(호스트)를 넣는다 —
         # VM 의 NAT 주소는 내 PC 의 kubectl 이 갈 수 없는 주소다.
-        result = cluster.up(vm_node, chosen, reporter, api_address=target.host)
+        result = cluster.up(
+            server, chosen, reporter, api_address=target.host, agents=agents
+        )
 
     _print_up_result(result, chosen.name, target)
 
@@ -672,6 +759,11 @@ def up(
     vm_mode: bool = typer.Option(
         False, "--vm", help="Run the cluster inside a VM on the host"
     ),
+    nodes: Optional[int] = typer.Option(
+        None,
+        "--nodes",
+        help="How many VM nodes the cluster has (requires --vm; default 1)",
+    ),
     assume_yes: bool = typer.Option(
         False, "--yes", "-y", help="Do not ask for confirmation"
     ),
@@ -681,13 +773,25 @@ def up(
     Asks which distribution to install when the host is empty (pass --distro
     to skip the question, e.g. in scripts). If one is already installed it is
     detected and left alone, so re-running is safe. With --vm the cluster
-    runs inside a VM on the host instead of on the host itself.
+    runs inside a VM on the host instead of on the host itself, and --nodes
+    spreads it over that many VMs.
     """
     target = _load_target(name)
 
     if vm_mode:
-        _up_vm(name, target, distro)
+        _up_vm(name, target, distro, nodes)
         return
+
+    # 노드를 늘리려면 기계를 늘려야 하고, 호스트 모드에는 기계가 하나뿐이다.
+    if nodes is not None and nodes != 1:
+        _fail(
+            "--nodes needs --vm",
+            [
+                "A node is a machine. Host mode has exactly one, so extra nodes",
+                "have nowhere to live — VMs are what makes more of them:",
+                f"    ssherpa up {name} --vm --nodes {nodes}",
+            ],
+        )
 
     node = cluster.nodes_for_host_mode(target)[0]
 
@@ -759,13 +863,42 @@ def status(
         host = cluster.status(node, known)
         vms = [(vm, vm_mod.vm_state(target, vm)) for vm in vm_mod.list_vms(target)]
 
+        # VM 안의 클러스터도 물어본다. 호스트만 보고 'not installed' 라고
+        # 하면, 3노드가 멀쩡히 도는 중에도 아무것도 없다고 답하게 된다.
+        #
+        # 안을 못 들여다보는 것(꺼진 VM, 안 뜬 k3s)은 보고를 멈출 이유가
+        # 아니다 — status 는 아픈 호스트 앞에서도 아는 만큼은 말해야 한다.
+        # 호스트 자체의 접속은 위에서 이미 성공했으므로 여기서 삼키는 것은
+        # VM 안쪽 사정뿐이다.
+        inside = None
+        unreachable = None
+        if vms:
+            try:
+                info = vm_mod.find(target)
+                if info is not None:
+                    inside = cluster.status(
+                        cluster.Node(
+                            name=info.name,
+                            target=vm_mod.vm_target(target, info),
+                            cli_name=name,
+                            in_vm=True,
+                        ),
+                        known,
+                    )
+            except (VmError, SSHError) as exc:
+                # 못 물어봤다는 사실 자체가 보고할 내용이다. 조용히 넘기면
+                # 침묵이 '클러스터가 없다' 로 읽힌다 (실측: server 노드가
+                # 꺼져 있을 때 아무 줄도 나오지 않았다).
+                unreachable = exc.message
+
     table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
     table.add_column(no_wrap=True, style="bold")
     table.add_column(no_wrap=True)
     table.add_column(overflow="fold")
+    where = " on the host" if vms else ""
     for entry in host.distros:
         if not entry.installed:
-            table.add_row(entry.name, "[dim]—[/dim]", "[dim]not installed[/dim]")
+            table.add_row(entry.name, "[dim]—[/dim]", f"[dim]not installed{where}[/dim]")
             continue
         colour = "green" if entry.running else "yellow"
         state = entry.service_state or "unknown"
@@ -777,18 +910,46 @@ def status(
     console.print(Padding(table, (0, 0, 0, 2)))
     console.print()
 
-    for vm_name, state in vms:
-        colour = "green" if state == "running" else "yellow"
+    if vms:
+        for index, (vm_name, state) in enumerate(vms):
+            colour = "green" if state == "running" else "yellow"
+            label = "[dim]vm:[/dim]" if index == 0 else "   "
+            console.print(
+                Padding(
+                    f"{label}  {vm_name}  [{colour}]{state or 'unknown'}[/{colour}]",
+                    (0, 0, 0, 2),
+                )
+            )
+        console.print()
+
+    # VM 안에서 도는 클러스터를 한 줄로 요약한다.
+    if inside is not None and inside.running:
+        running = inside.running[0].name
+        ready = inside.ready_count
+        total = len(inside.node_lines)
+        shape = f"{ready}/{total} nodes Ready" if total else "no nodes yet"
+        colour = "green" if total and ready == total else "yellow"
         console.print(
             Padding(
-                f"[dim]vm:[/dim]  {vm_name}  [{colour}]{state or 'unknown'}[/{colour}]",
+                f"[dim]cluster:[/dim]  {running} in the VMs  "
+                f"[{colour}]{shape}[/{colour}]",
                 (0, 0, 0, 2),
             )
         )
         console.print()
-
-    if host.node_line:
-        console.print(Padding(f"[dim]node:[/dim]  {host.node_line}", (0, 0, 0, 2)))
+    elif unreachable:
+        console.print(
+            Padding(
+                f"[dim]cluster:[/dim]  [yellow]could not ask the VMs — "
+                f"{unreachable}[/yellow]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
+    elif host.node_lines:
+        console.print(
+            Padding(f"[dim]node:[/dim]  {host.node_lines[0]}", (0, 0, 0, 2))
+        )
         console.print()
 
     if host.conflicted:
@@ -881,13 +1042,16 @@ def down(
                 vm_mod.destroy(target, vm_name, reporter)
             vm_mod.unexpose_api(target, reporter)
 
-        # 죽은 클러스터를 가리키는 로컬 흔적도 함께 걷는다 (host 모드와 동일)
-        entry = f"{name}-vm"
-        path = cluster.kubeconfig_path(entry)
-        if path.exists():
-            path.unlink()
-        with contextlib.suppress(kubeconf.KubeconfigError):
-            kubeconf.remove(entry)
+        # 죽은 클러스터를 가리키는 로컬 흔적도 함께 걷는다 (host 모드와 동일).
+        # 이름은 up 이 쓴 것과 같은 함수로 짓는다 — 각자 지으면 한쪽만 바뀌었을
+        # 때 지워지지 않고 남는다 (실측).
+        for vm_name in vms:
+            entry = vm_mod.node_label(name, vm_name)
+            path = cluster.kubeconfig_path(entry)
+            if path.exists():
+                path.unlink()
+            with contextlib.suppress(kubeconf.KubeconfigError):
+                kubeconf.remove(entry)
 
     for distro_name in installed:
         chosen = _resolve_distro(distro_name)
@@ -939,6 +1103,8 @@ def ssh_cmd(
         argv += ["-i", os.path.expanduser(target.key)]
     if target.jump:
         argv += ["-J", target.jump]
+    if target.known_hosts:
+        argv += ["-o", f"UserKnownHostsFile={os.path.expanduser(target.known_hosts)}"]
     argv += [target.destination(), *ctx.args]
 
     # 대화형 세션이므로 출력을 가로채지 않고 그대로 넘긴다.

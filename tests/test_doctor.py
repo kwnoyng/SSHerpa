@@ -107,6 +107,26 @@ class TestCapableHost:
         assert "fits ~7" in memory_row[2]  # (16000-1500)//2048 = 7
 
 
+class TestVmCapacity:
+    """표시용 추정치이자 멀티노드가 노드 수를 거절하는 기준 — 같은 식이어야
+    'fits ~7' 이라 해놓고 3에서 거절하는 일이 없다."""
+
+    def test_matches_the_displayed_estimate(self):
+        result = diagnose(probe_output(mem_kb=16384000))  # 16 GB
+        memory_row = next(r for r in result.rows if r[0] == "Memory")
+        assert f"fits ~{doctor.vm_capacity(16000)}" in memory_row[2]
+
+    def test_host_keeps_a_share_for_itself(self):
+        # 16 GB 를 전부 VM 에 주면 호스트가 굶는다
+        assert doctor.vm_capacity(16000) == (16000 - 1500) // 2048
+
+    def test_never_negative(self):
+        assert doctor.vm_capacity(500) == 0
+
+    def test_unknown_memory_gives_no_number(self):
+        assert doctor.vm_capacity(None) is None
+
+
 class TestVirtualizationHints:
     """같은 실패, 환경별로 다른 처방 — doctor 의 존재 이유."""
 

@@ -151,6 +151,9 @@ def _run_step(target: Target, step: Step) -> None:
 class SetupResult:
     already_installed: bool  # virsh 가 이미 있었다 (패키지 설치를 건너뜀)
     virsh_version: str
+    # 이 호스트가 감당할 수 있는 VM 대수. 노드 수를 요청받은 쪽이
+    # 시작 전에 거절할 수 있도록 진단에서 그대로 들고 나온다.
+    vm_capacity: Optional[int] = None
 
 
 def setup(target: Target, reporter=None) -> SetupResult:
@@ -166,6 +169,7 @@ def setup(target: Target, reporter=None) -> SetupResult:
         probe = run(target, SETUP_PROBE, timeout=60)
         head, _, os_text = probe.stdout.partition("SSHERPA_OSRELEASE")
         facts = doctor.parse_probe(head)
+        capacity = doctor.vm_capacity(facts.memory_mb)
 
         diagnosis = doctor.diagnose(facts)
         if not diagnosis.capable:
@@ -213,4 +217,8 @@ def setup(target: Target, reporter=None) -> SetupResult:
                 + [f"Inspect the host:  ssherpa ssh {target.name or ''}".rstrip()],
             )
 
-    return SetupResult(already_installed=already, virsh_version=state.virsh_version)
+    return SetupResult(
+        already_installed=already,
+        virsh_version=state.virsh_version,
+        vm_capacity=capacity,
+    )

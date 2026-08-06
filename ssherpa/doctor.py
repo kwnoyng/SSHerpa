@@ -91,6 +91,17 @@ def parse_probe(stdout: str) -> HostFacts:
     return facts
 
 
+def vm_capacity(memory_mb: Optional[int]) -> Optional[int]:
+    """이 메모리로 감당할 수 있는 2GB VM 대수. 읽지 못했으면 None.
+
+    doctor 가 보여주는 추정치이자, 멀티노드가 노드 수를 거절할 때 쓰는
+    기준이다 — 표시와 판정이 같은 식이어야 안내와 결과가 어긋나지 않는다.
+    """
+    if memory_mb is None:
+        return None
+    return max(0, (memory_mb - HOST_RESERVE_MB) // PER_VM_MB)
+
+
 def _in_container(facts: HostFacts) -> bool:
     return facts.container not in ("", "none")
 
@@ -233,7 +244,7 @@ def diagnose(facts: HostFacts) -> Diagnosis:
     if facts.memory_mb is None:
         result.rows.append(("Memory", "info", "could not read /proc/meminfo"))
     elif facts.memory_mb >= MIN_MEMORY_MB:
-        capacity = (facts.memory_mb - HOST_RESERVE_MB) // PER_VM_MB
+        capacity = vm_capacity(facts.memory_mb)
         result.rows.append(
             (
                 "Memory",

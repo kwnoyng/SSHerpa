@@ -9,7 +9,7 @@ import contextlib
 import re
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +47,12 @@ class Node:
     role: str = "server"  # server | agent
     cli_name: Optional[str] = None  # 사용자가 등록한 타겟 이름
     in_vm: bool = False  # 이 노드가 호스트 위의 VM 인가
+    short_name: Optional[str] = None  # 진행 표시에 쓸 짧은 이름
+
+    def label(self) -> str:
+        """진행 표시에 붙일 이름. 어느 노드의 일인지 보이지 않으면 같은
+        단계가 여러 번 지나갈 때 전부 다시 하는 것처럼 읽힌다 (실사용 오해)."""
+        return self.short_name or self.name
 
     def _cli(self, verb: str, *flags: str) -> str:
         parts = ["ssherpa", verb]
@@ -156,27 +162,45 @@ def check_memory(node: Node, distro: Distro) -> None:
     raise ClusterError(f"not enough memory for {distro.name}", hints)
 
 
-def wait_for_ready(node: Node, distro: Distro) -> None:
-    """노드가 Ready 상태가 될 때까지 기다린다."""
+def count_ready(status_output: str) -> int:
+    """kubectl get nodes 출력에서 Ready 인 노드 수를 센다.
+
+    'NotReady' 도 두 번째 칸에 오므로 정확히 비교해야 한다.
+    """
+    ready = 0
+    for line in status_output.splitlines():
+        fields = line.split()
+        # NAME STATUS ROLES AGE VERSION
+        if len(fields) >= 2 and fields[1] == "Ready":
+            ready += 1
+    return ready
+
+
+def wait_for_ready(node: Node, distro: Distro, expected: int = 1) -> None:
+    """노드가 expected 개만큼 Ready 가 될 때까지 기다린다.
+
+    상태는 언제나 server 노드에게 묻는다 — 클러스터 전체를 아는 것은
+    거기뿐이고, agent 에는 kubeconfig 자체가 없다.
+    """
     deadline = time.monotonic() + READY_TIMEOUT
-    last = ""
+    ready = 0
 
     while time.monotonic() < deadline:
         result = run(node.target, distro.node_status_command(), timeout=60)
-        for line in result.stdout.splitlines():
-            fields = line.split()
-            # NAME STATUS ROLES AGE VERSION  —  'NotReady' 와 구분해야 한다
-            if len(fields) >= 2:
-                last = fields[1]
-                if last == "Ready":
-                    return
+        ready = count_ready(result.stdout)
+        if ready >= expected:
+            return
         time.sleep(READY_POLL_INTERVAL)
 
+    detail = (
+        f"only {ready} of {expected} nodes are Ready"
+        if expected > 1
+        else "the node never reported Ready"
+    )
     raise ClusterError(
-        f"node did not become ready within {READY_TIMEOUT}s"
-        + (f" (last status: {last})" if last else ""),
+        f"cluster did not become ready within {READY_TIMEOUT}s ({detail})",
         [
-            "The install finished but the node never reported Ready.",
+            "The install finished but the cluster never reached the expected size.",
             f"Inspect the service:  {node.cli_ssh()}",
             f"    sudo journalctl -u {distro.name}-server -n 50",
         ],
@@ -270,6 +294,46 @@ class UpResult:
     context: Optional[str] = None  # ~/.kube/config 에 병합된 컨텍스트 이름
     context_is_current: bool = False  # current-context 로 잡혔나
     merge_error: Optional[str] = None  # 병합 실패 사유 (클러스터 자체는 정상)
+    node_count: int = 1  # 클러스터를 이루는 노드 수
+
+
+def read_token(node: Node, distro: Distro) -> str:
+    """server 가 발급한 합류 토큰. agent 는 이것 없이 들어올 수 없다."""
+    result = run(node.target, distro.read_token_command(), timeout=60)
+    token = result.stdout.strip()
+    if result.rc != 0 or not token:
+        raise ClusterError(
+            "could not read the cluster join token",
+            [
+                f"Expected it at {distro.token_path} on the first node.",
+                "Without it the other nodes cannot join.",
+            ],
+        )
+    return token
+
+
+def join_agents(
+    server: Node, agents: list[Node], distro: Distro, reporter=None
+) -> None:
+    """agent 노드들을 server 가 이미 서 있는 클러스터에 합류시킨다.
+
+    server 를 먼저 세우고 토큰을 읽어야 하므로 이 단계는 뒤로 밀 수 없다.
+    agent 끼리는 서로를 몰라도 되니 순서는 상관없다.
+    """
+    reporter = reporter or NullReporter()
+
+    with reporter.step("read join token"):
+        token = read_token(server, distro)
+
+    # agent 는 server 의 노드 주소로 붙는다. 밖에서 닿는 주소(api_address)가
+    # 아니다 — 같은 네트워크 안에 있으니 굳이 밖으로 돌아 나갈 이유가 없고,
+    # NAT 뒤에서는 그 주소로 자기 자신을 찾지도 못한다.
+    server_address = server.target.host
+
+    for agent in agents:
+        for step in distro.agent_install_steps(server_address, token):
+            with reporter.step(f"{agent.label()}: {step.label}"):
+                _run_step(agent, step)
 
 
 def up(
@@ -277,8 +341,12 @@ def up(
     distro: Distro,
     reporter=None,
     api_address: Optional[str] = None,
+    agents: Optional[list[Node]] = None,
 ) -> UpResult:
-    """노드 하나에 쿠버네티스를 설치하고 kubeconfig 를 가져온다.
+    """클러스터를 세우고 kubeconfig 를 가져온다.
+
+    node 는 server, agents 는 그 뒤에 합류시킬 노드들이다. agents 가 비면
+    단일 노드 클러스터이고, 그때의 동작은 예전과 같다.
 
     api_address 는 '내 PC 의 kubectl 이 접속할 주소'다. host 모드에서는
     노드 주소 그대로지만, vm 모드에서는 노드(VM)의 주소가 NAT 안이라
@@ -286,6 +354,8 @@ def up(
     """
     reporter = reporter or NullReporter()
     api_address = api_address or node.target.host
+    agents = agents or []
+    expected = 1 + len(agents)
 
     with reporter.step("preflight"):
         already = is_installed(node, distro)
@@ -297,8 +367,16 @@ def up(
             with reporter.step(step.label):
                 _run_step(node, step)
 
+    # server 가 Ready 여야 토큰이 발급돼 있고 합류를 받을 수 있다.
     with reporter.step("wait for node"):
         wait_for_ready(node, distro)
+
+    if agents:
+        pending = [a for a in agents if not is_installed(a, distro)]
+        if pending:
+            join_agents(node, pending, distro, reporter)
+        with reporter.step(f"wait for {expected} nodes"):
+            wait_for_ready(node, distro, expected=expected)
 
     # 인증서가 지금 접속 주소를 포함하는지 확인한다. 클라우드에서 중지/재시작
     # 으로 IP 가 바뀐 뒤 재실행하면, kubeconfig 만 갱신되고 인증서는 옛 주소로
@@ -356,6 +434,7 @@ def up(
         context=context,
         context_is_current=is_current,
         merge_error=merge_error,
+        node_count=expected,
     )
 
 
@@ -412,7 +491,11 @@ class DistroStatus:
 @dataclass
 class HostStatus:
     distros: list[DistroStatus]
-    node_line: Optional[str] = None  # kubectl get nodes 한 줄
+    node_lines: list[str] = field(default_factory=list)  # kubectl get nodes 출력
+
+    @property
+    def ready_count(self) -> int:
+        return count_ready("\n".join(self.node_lines))
 
     @property
     def installed(self) -> list[DistroStatus]:
@@ -455,9 +538,9 @@ def status(node: Node, distros: list[Distro]) -> HostStatus:
         state = states.get(distro.name)
         if state and state.running:
             nodes = run(node.target, distro.node_status_command(), timeout=60)
-            line = nodes.stdout.strip().splitlines()
-            if line:
-                host.node_line = line[0]
+            host.node_lines = [
+                line for line in nodes.stdout.strip().splitlines() if line.strip()
+            ]
             break
 
     return host
