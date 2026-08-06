@@ -217,6 +217,14 @@ Worth knowing:
 - **kubectl connects through the host's address.** The VM lives on a NAT
   network only the host can see, so the host forwards port 6443 inward —
   the same trick as port-forwarding on a home router.
+- **A host reboot is survivable, unattended.** Forwarding rules live in
+  kernel memory, so a restart would otherwise leave the VM running and
+  healthy with no way in from outside — the worst kind of failure, since
+  everything looks fine from the host. SSHerpa installs a small systemd
+  unit that re-applies its own rules at boot (not the distro's
+  save-everything mechanism, which would also resurrect rules an
+  administrator deliberately removed), and pins the VM's address in
+  libvirt's DHCP so those rules still point at the right place.
 - **Host mode and VM mode cannot share a host** — both need port 6443.
   `up` refuses either direction and says what to remove.
 - **Re-running is safe**, as always: the VM and the cluster inside it are

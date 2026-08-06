@@ -229,6 +229,132 @@ class TestApiExposure:
         assert str(API_PORT) in vm.expose_api_step("h").command
 
 
+class TestForwardingSurvivesReboot:
+    """규칙은 커널 메모리에만 산다 — 재부팅이면 VM 은 살아 있는데 길만 사라진다.
+
+    실측(0.4.x): 호스트 재부팅 후 VM 은 autostart 로 돌아오고 안의 k3s 도
+    active 인데, DNAT 규칙만 없어져 kubectl 이 조용히 끊겼다.
+    """
+
+    def test_rule_is_registered_to_run_at_boot(self):
+        command = vm.expose_api_step("192.168.122.65").command
+        assert f"systemctl enable {vm.FORWARD_UNIT}" in command
+
+    def test_boot_unit_runs_the_same_script_as_now(self):
+        # 지금 세우는 규칙과 부팅 때 세울 규칙이 다른 코드면 언젠가 갈라진다
+        assert f"ExecStart={vm.FORWARD_SCRIPT}" in vm.forward_unit()
+        assert vm.FORWARD_SCRIPT in vm.expose_api_step("h").command
+
+    def test_script_carries_the_actual_rules(self):
+        script = vm.forward_script("192.168.122.65")
+        assert script.startswith("#!/bin/sh")
+        assert "--to-destination 192.168.122.65:6443" in script
+        assert "-I FORWARD 1" in script
+
+    def test_script_runs_as_root_without_sudo(self):
+        # systemd 가 root 로 실행한다. sudo 가 섞이면 부팅 시점에 깨진다.
+        assert "sudo" not in vm.forward_script("h")
+
+    def test_script_left_on_the_host_is_english(self):
+        # 이 파일은 고객사 호스트에 남아 그곳 관리자가 읽는다 —
+        # 저장소 안의 주석과 달리 여기는 사용자의 자리다.
+        assert vm.forward_script("h").isascii()
+        assert vm.forward_unit().isascii()
+
+    def test_unit_waits_for_libvirt(self):
+        # libvirt 는 네트워크를 켤 때 FORWARD 에 거부 규칙을 넣는다.
+        # 우리가 먼저 들어가면 그 뒤로 밀려 통과하지 못한다.
+        unit = vm.forward_unit()
+        assert "After=" in unit and "libvirtd.service" in unit
+
+    def test_rerun_restarts_rather_than_starts(self):
+        # 이미 적용된 oneshot 유닛은 start 로 다시 실행되지 않는다 —
+        # 주소가 바뀐 재실행이 조용히 무시된다.
+        command = vm.expose_api_step("h").command
+        assert f"systemctl restart {vm.FORWARD_UNIT}" in command
+
+    def test_removal_takes_the_boot_hook_too(self):
+        # 유닛만 남기면 다음 부팅에 없는 VM 으로 가는 길을 다시 뚫는다
+        command = vm.unexpose_api_step().command
+        assert f"disable --now {vm.FORWARD_UNIT}" in command
+        assert vm.FORWARD_UNIT_PATH in command
+        assert vm.FORWARD_SCRIPT in command
+
+    def test_expose_refuses_to_claim_survival_it_did_not_verify(self, host):
+        # systemctl 이 enabled 라고 답하지 않으면 성공을 선언하지 않는다
+        fake = host(state="running")
+        with pytest.raises(vm.VmError) as excinfo:
+            vm.expose_api(TARGET, "192.168.122.65")
+        assert "survive a reboot" in excinfo.value.message
+        assert fake.ran("systemctl is-enabled")
+
+    def test_expose_passes_when_registered(self, host, monkeypatch):
+        fake = host(state="running")
+
+        def enabled_run(target, command, timeout=30):
+            if "is-enabled" in command:
+                return CommandResult(0, "enabled\n", "")
+            return fake.run(target, command, timeout)
+
+        monkeypatch.setattr(vm, "run", enabled_run)
+        vm.expose_api(TARGET, "192.168.122.65")  # 예외 없이 통과
+
+
+class TestAddressReservation:
+    """주소가 바뀌면 부팅 때 다시 세운 규칙이 없는 VM 을 가리킨다.
+
+    실측으로 VM 재생성마다 .250 → .160 → .231 로 옮겨 다녔다. 규칙이
+    쫓아다니게 하는 것보다 주소를 못박는 편이 단순하다.
+    """
+
+    def test_reserves_the_address_for_this_vm(self):
+        command = vm.reserve_ip_step("ssherpa-node-1", "52:54:00:ab:cd:ef", "192.168.122.65")
+        assert "add ip-dhcp-host" in command.command
+        assert "mac='52:54:00:ab:cd:ef'" in command.command
+        assert "ip='192.168.122.65'" in command.command
+
+    def test_reservation_persists_past_reboot(self):
+        # --config 가 없으면 예약도 메모리에만 남아 같은 문제를 반복한다
+        assert "--config" in vm.reserve_ip_step("n", "m", "i").command
+
+    def test_stale_reservations_are_cleared_first(self):
+        # 지워진 VM 이 남긴 예약이 같은 주소를 붙들고 있으면 add 가 실패한다.
+        # MAC 으로 한 번, IP 로 한 번 — 어느 쪽으로 남아 있든 걷어낸다.
+        command = vm.reserve_ip_step("n", "52:54:00:ab:cd:ef", "192.168.122.65").command
+        assert command.index("delete ip-dhcp-host") < command.index("add ip-dhcp-host")
+        assert command.count("delete ip-dhcp-host") == 2
+
+    def test_release_only_deletes(self):
+        command = vm.release_ip_step("52:54:00:ab:cd:ef").command
+        assert "delete ip-dhcp-host" in command
+        assert "add ip-dhcp-host" not in command
+
+    def test_create_pins_the_address(self, host):
+        fake = host(state="")
+        vm.create(TARGET)
+        assert fake.ran("add ip-dhcp-host")
+
+    def test_existing_vm_gets_pinned_too(self, host):
+        # 옛 버전이 만든 VM 도 재실행 한 번으로 주소가 고정돼야 한다
+        fake = host(state="running")
+        vm.create(TARGET)
+        assert fake.ran("add ip-dhcp-host")
+
+    def test_destroy_releases_the_reservation(self, host, monkeypatch):
+        fake = host(state="running")
+        original = fake.run
+
+        def run_then_gone(target, command, timeout=30):
+            result = original(target, command, timeout)
+            if "undefine" in command:
+                fake.state = ""
+            return result
+
+        monkeypatch.setattr(vm, "run", run_then_gone)
+        vm.destroy(TARGET, "ssherpa-node-1")
+        assert fake.ran("delete ip-dhcp-host")
+
+
 class TestListVms:
     def test_filters_to_ssherpa_prefix(self, monkeypatch):
         # 고객사 호스트에는 남의 VM 이 있을 수 있다 — 우리 것만 보인다
