@@ -123,6 +123,7 @@ class TestUnattendedDestruction:
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(cli, "_installed_on", lambda _n: installed)
         monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: vms)
+        monkeypatch.setattr(cli.vm_mod, "forwarding_installed", lambda _t: bool(vms))
         monkeypatch.setattr(cli, "_interactive", lambda: False)
 
     def _destroyed(self, monkeypatch):
@@ -541,6 +542,7 @@ class TestLocalTracesAreRemoved:
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
         monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: vms)
+        monkeypatch.setattr(cli.vm_mod, "forwarding_installed", lambda _t: True)
         monkeypatch.setattr(cli.vm_mod, "destroy", lambda *_a, **_k: True)
         monkeypatch.setattr(cli.vm_mod, "unexpose_api", lambda *_a, **_k: None)
         monkeypatch.setattr(cli.cluster, "kubeconfig_dir", lambda: tmp_path)
@@ -649,3 +651,88 @@ class TestDoctorHintsAreRunnable:
         out = captured.get()
         assert "ssherpa up 10.0.0.10" not in out  # 등록된 적 없는 이름
         assert "target add" in out
+
+
+class TestBrokenPromptIsNotConsent:
+    """물어보지 못한 것은 승낙이 아니다.
+
+    되돌릴 수 있는 동작은 막지 않는 편이 낫지만, 파괴는 다르다.
+    """
+
+    def test_reversible_actions_still_proceed(self, monkeypatch):
+        from ssherpa import cli
+
+        monkeypatch.setattr(cli, "_interactive", lambda: True)
+        monkeypatch.setattr(
+            cli.questionary, "confirm", lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("No Windows console found")
+            )
+        )
+        assert cli._confirm("Continue?", assume_yes=False) is True
+
+    def test_destruction_stops(self, monkeypatch):
+        from ssherpa import cli
+
+        monkeypatch.setattr(cli, "_interactive", lambda: True)
+        monkeypatch.setattr(
+            cli.questionary, "confirm", lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("No Windows console found")
+            )
+        )
+        assert cli._confirm("Continue?", assume_yes=False, fallback=False) is False
+
+    def test_down_uses_the_strict_fallback(self, monkeypatch):
+        import typer
+
+        from ssherpa import cli
+        from ssherpa.ssh import Target
+
+        target = Target(name="lab-01", host="10.0.0.1")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        monkeypatch.setattr(cli, "_installed_on", lambda _n: ["k3s"])
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: [])
+        monkeypatch.setattr(cli.vm_mod, "forwarding_installed", lambda _t: False)
+        monkeypatch.setattr(cli, "_interactive", lambda: True)
+        monkeypatch.setattr(
+            cli.questionary, "confirm", lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("no console")
+            )
+        )
+        destroyed = []
+        monkeypatch.setattr(
+            cli.cluster, "down", lambda *_a, **_k: destroyed.append("host") or True
+        )
+        with pytest.raises(typer.Exit):
+            cli.down("lab-01", assume_yes=False)
+        assert destroyed == []
+
+
+class TestLeftoverForwardingIsRemovable:
+    """VM 을 손으로 지운 뒤 down 하면 목록은 비어 있지만 포워딩은 남는다."""
+
+    def _wire(self, monkeypatch, forwarding):
+        from ssherpa import cli
+        from ssherpa.ssh import Target
+
+        target = Target(name="lab-01", host="10.0.0.1")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: [])
+        monkeypatch.setattr(cli.vm_mod, "forwarding_installed", lambda _t: forwarding)
+        closed = []
+        monkeypatch.setattr(
+            cli.vm_mod, "unexpose_api", lambda *_a, **_k: closed.append("closed")
+        )
+        return cli, closed
+
+    def test_leftovers_are_swept(self, monkeypatch):
+        cli, closed = self._wire(monkeypatch, forwarding=True)
+        cli.down("lab-01", assume_yes=True)
+        assert closed == ["closed"]
+
+    def test_truly_empty_host_says_so(self, monkeypatch):
+        cli, closed = self._wire(monkeypatch, forwarding=False)
+        with cli.console.capture() as captured:
+            cli.down("lab-01", assume_yes=True)
+        assert "Nothing is installed" in captured.get()
+        assert closed == []

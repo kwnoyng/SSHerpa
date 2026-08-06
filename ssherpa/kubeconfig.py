@@ -12,6 +12,7 @@ kubectl 은 환경변수가 없으면 ~/.kube/config 를 읽는다. up 이 가�
     사용자의 기본값을 몰래 바꾸면 그쪽 운영 사고로 이어질 수 있다.
 """
 
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -19,6 +20,19 @@ from typing import Optional
 import yaml
 
 SECTIONS = ("clusters", "users", "contexts")
+
+# kubeconfig 는 클라이언트 인증서와 토큰을 담는다 — 관례가 0600 인 이유다.
+# Path.write_text 는 umask 를 따라 보통 0644 로 만들어, 공용 리눅스 장비에서
+# 같은 머신의 다른 계정이 남의 클러스터 자격증명을 읽게 된다.
+PRIVATE_MODE = 0o600
+
+
+def write_private(path: Path, text: str) -> None:
+    """자격증명이 든 파일을 주인만 읽을 수 있게 쓴다."""
+    path.write_text(text, encoding="utf-8")
+    # Windows 에는 이 개념이 없다 — 못 바꿨다고 실패시킬 일은 아니다.
+    with contextlib.suppress(OSError):
+        path.chmod(PRIVATE_MODE)
 
 
 class KubeconfigError(Exception):
@@ -90,7 +104,10 @@ def merge(
     backup = None
     if original is not None:
         backup = path.with_name(path.name + ".ssherpa-backup")
-        backup.write_text(original, encoding="utf-8")
+        # 백업은 'SSHerpa 가 손대기 전' 을 담는다. 매번 덮어쓰면 두 번째
+        # 실행에서 이미 병합된 내용으로 바뀌어, 되돌릴 원본이 사라진다.
+        if not backup.exists():
+            write_private(backup, original)
 
     # 병합하기 전에 이 파일에 컨텍스트가 있었는지 봐 둔다 — 뒤에서
     # current-context 를 건드려도 되는지 판단하는 근거다.
@@ -130,9 +147,8 @@ def merge(
     became_current = data.get("current-context") == name
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(data, sort_keys=False, default_flow_style=False),
-        encoding="utf-8",
+    write_private(
+        path, yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
     )
     return MergeResult(context=name, became_current=became_current, backup=backup)
 

@@ -601,3 +601,42 @@ class TestLookupDoesNotWait:
         with pytest.raises(vm.VmError):
             vm.wait_for_ip(TARGET, "ssherpa-node-1", timeout=6)
         assert slept  # 폴링했다
+
+
+class TestHostQueryFailuresAreNotSilence:
+    """'virsh 가 없다' 와 'virsh 가 대답을 못 한다' 는 다른 사실이다.
+
+    뭉뚱그리면 libvirtd 가 죽은 호스트에서 'VM 없음' 이라 답하게 되고,
+    down 은 멀쩡한 클러스터를 두고 "지울 것이 없다" 며 끝난다.
+    """
+
+    def test_host_without_virsh_is_not_an_error(self, monkeypatch):
+        monkeypatch.setattr(
+            vm, "run", lambda *a, **k: CommandResult(0, "SSHERPA_NO_VIRSH\n", "")  # noqa: ARG005
+        )
+        assert vm.list_vms(TARGET) == []
+
+    def test_virsh_that_cannot_answer_is_reported(self, monkeypatch):
+        monkeypatch.setattr(
+            vm,
+            "run",
+            lambda *a, **k: CommandResult(  # noqa: ARG005
+                1, "", "error: failed to connect to the hypervisor"
+            ),
+        )
+        with pytest.raises(vm.VmError) as excinfo:
+            vm.list_vms(TARGET)
+        assert "which VMs exist" in excinfo.value.message
+        assert any("libvirtd" in hint for hint in excinfo.value.hints)
+
+    def test_forwarding_leftovers_are_detectable(self, monkeypatch):
+        # VM 을 손으로 지워도 유닛과 스크립트는 남는다
+        monkeypatch.setattr(
+            vm, "run", lambda *a, **k: CommandResult(0, "", "")  # noqa: ARG005
+        )
+        assert vm.forwarding_installed(TARGET) is True
+
+        monkeypatch.setattr(
+            vm, "run", lambda *a, **k: CommandResult(1, "", "")  # noqa: ARG005
+        )
+        assert vm.forwarding_installed(TARGET) is False

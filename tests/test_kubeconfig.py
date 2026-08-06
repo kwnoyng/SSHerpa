@@ -5,6 +5,8 @@
 는 규칙을 고정한다.
 """
 
+import os
+
 import pytest
 import yaml
 
@@ -278,3 +280,34 @@ class TestNeverStealsAnotherDefault:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert data["current-context"] == "ssherpa-lab-01"
         assert result.became_current is True
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX permission bits do not exist on Windows"
+)
+class TestCredentialFilesArePrivate:
+    """kubeconfig 는 인증서와 토큰을 담는다. 기본 권한(0644)으로 만들면
+    공용 장비에서 같은 머신의 다른 계정이 남의 클러스터에 들어간다."""
+
+    def test_merged_config_is_owner_only(self, tmp_path):
+        path = tmp_path / "config"
+        kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert path.stat().st_mode & 0o077 == 0
+
+    def test_backup_is_owner_only(self, tmp_path):
+        path = tmp_path / "config"
+        path.write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
+        result = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        assert result.backup.stat().st_mode & 0o077 == 0
+
+    def test_backup_keeps_the_pre_ssherpa_original(self, tmp_path):
+        # 매번 덮어쓰면 두 번째 실행에서 이미 병합된 내용으로 바뀌어,
+        # 되돌릴 원본이 사라진다
+        path = tmp_path / "config"
+        original = "apiVersion: v1\nkind: Config\n# mine\n"
+        path.write_text(original, encoding="utf-8")
+
+        first = kubeconfig.merge(FETCHED, "lab-01", path=path)
+        kubeconfig.merge(FETCHED, "lab-02", path=path)
+
+        assert first.backup.read_text(encoding="utf-8") == original

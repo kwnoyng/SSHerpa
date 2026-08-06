@@ -605,6 +605,9 @@ def unexpose_api(target: Target, reporter=None) -> None:
         _run_step(target, step)
 
 
+_NO_VIRSH = "SSHERPA_NO_VIRSH"
+
+
 def list_vms(target: Target) -> list[str]:
     """호스트에 있는 SSHerpa 소유 VM 이름 목록.
 
@@ -613,13 +616,44 @@ def list_vms(target: Target) -> list[str]:
     돌려준다 — 첫 번째가 언제나 server(node-1) 라는 약속도 여기 걸려 있다.
 
     virsh 가 없는 호스트(host 모드만 쓰는)는 빈 목록이다 — 오류가 아니다.
+    하지만 virsh 가 있는데 대답하지 못하는 것은 다르다. 둘을 뭉뚱그리면
+    libvirtd 가 죽은 호스트에서 'VM 없음' 이라 답하게 되고, down 은
+    멀쩡한 클러스터를 두고 "지울 것이 없다" 며 끝난다.
     """
-    result = run(target, "sudo virsh list --all --name 2>/dev/null || true")
+    result = run(
+        target,
+        f"command -v virsh >/dev/null 2>&1 || {{ echo {_NO_VIRSH}; exit 0; }}\n"
+        "sudo virsh list --all --name",
+    )
+    if _NO_VIRSH in result.stdout:
+        return []
+    if result.rc != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise VmError(
+            "could not ask the host which VMs exist",
+            (detail[-2:] if detail else [])
+            + [
+                "virsh is installed but did not answer, so SSHerpa cannot tell",
+                "whether a VM cluster is running here.",
+                "    systemctl status libvirtd",
+            ],
+        )
     return sorted(
         line.strip()
         for line in result.stdout.splitlines()
         if line.strip().startswith(VM_PREFIX)
     )
+
+
+def forwarding_installed(target: Target) -> bool:
+    """포워딩 장치가 호스트에 남아 있는가.
+
+    VM 을 손으로 지운 뒤에도 유닛과 스크립트는 남는다. 그 상태를 모르면
+    down 이 그것들을 지나쳐, 부팅마다 없는 주소로 6443 을 넘기는 규칙이
+    되살아난다.
+    """
+    result = run(target, f"test -f {FORWARD_UNIT_PATH} || test -f {FORWARD_SCRIPT}")
+    return result.rc == 0
 
 
 def find(

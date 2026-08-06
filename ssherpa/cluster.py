@@ -273,7 +273,8 @@ def fetch_kubeconfig(node: Node, distro: Distro, api_address: str) -> Path:
     rewritten = rewrite_kubeconfig(result.stdout, api_address)
     path = kubeconfig_path(node.name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rewritten, encoding="utf-8")
+    # 이 파일은 클러스터 관리자 자격증명이다 — 주인만 읽을 수 있어야 한다.
+    kubeconf.write_private(path, rewritten)
     return path
 
 

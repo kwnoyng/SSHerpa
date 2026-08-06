@@ -484,14 +484,19 @@ def _prompt_for_distro():
     return _resolve_distro(answer)
 
 
-def _confirm(question: str, *, assume_yes: bool) -> bool:
-    """파괴적이거나 놀랄 수 있는 동작 전에 한 번 묻는다."""
+def _confirm(question: str, *, assume_yes: bool, fallback: bool = True) -> bool:
+    """파괴적이거나 놀랄 수 있는 동작 전에 한 번 묻는다.
+
+    fallback 은 '프롬프트를 띄울 수 없을 때 어떻게 할 것인가'다. 되돌릴 수
+    있는 동작은 막지 않는 편이 낫지만(True), 파괴는 아니다 — 물어보지
+    못한 것은 승낙이 아니므로 그쪽은 False 로 부른다.
+    """
     if assume_yes or not _interactive():
         return True
     try:
         return bool(questionary.confirm(question, default=False).ask())
-    except Exception:  # 프롬프트를 띄울 수 없으면 막지 않는다
-        return True
+    except Exception:
+        return fallback
 
 
 def _installed_on(node) -> list[str]:
@@ -1008,15 +1013,19 @@ def down(
     installed = _installed_on(node)
     with _surface_errors():
         vms = vm_mod.list_vms(target)
+        # VM 을 손으로 지운 뒤 down 하면 VM 목록은 비어 있지만 포워딩은
+        # 남는다. 그걸 안 걷으면 부팅마다 없는 주소로 6443 을 넘기는
+        # 규칙이 되살아나, 그 포트가 영영 막힌 호스트가 된다.
+        forwarding = vm_mod.forwarding_installed(target)
 
-    if not installed and not vms:
+    if not installed and not vms and not forwarding:
         console.print()
         console.print(Padding("[dim]Nothing is installed on this host.[/dim]", (0, 0, 0, 2)))
         console.print()
         return
 
     # 클러스터를 통째로 없애는 동작이라 되돌릴 수 없다.
-    removing = installed + vms
+    removing = installed + vms or ["the leftover API forwarding"]
     console.print()
     console.print(
         Padding(
@@ -1042,14 +1051,16 @@ def down(
             ],
         )
 
-    if not _confirm("Continue?", assume_yes=assume_yes):
+    # 프롬프트를 띄우지 못한 것도 승낙이 아니다 — 되돌릴 수 없는 쪽에서는
+    # 모르면 멈춘다.
+    if not _confirm("Continue?", assume_yes=assume_yes, fallback=False):
         raise typer.Exit(code=1)
 
     console.print()
     reporter = StepReporter(console)
 
     # VM 클러스터는 VM 삭제가 곧 제거다 — 안에서 k3s 를 지울 필요가 없다.
-    if vms:
+    if vms or forwarding:
         with _surface_errors():
             for vm_name in vms:
                 vm_mod.destroy(target, vm_name, reporter)
