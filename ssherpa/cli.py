@@ -132,10 +132,34 @@ def _resolve_target(
 
     check 와 doctor 가 같은 규칙을 쓴다 — 인자 해석이 두 벌로 갈라지면
     한쪽만 고쳐지는 일이 생긴다.
+
+    등록된 이름을 줬으면 접속 정보는 전부 인벤토리에서 온다. --host/--user
+    만 막고 --port/--key 는 조용히 버리면, 같은 함수 안에 규칙이 두 개가
+    된다 — 사용자는 `check lab-01 --key ~/.ssh/other` 가 그 키로 붙었다고
+    믿게 되고, 실제로는 인벤토리의 키로 붙는다.
     """
     if name:
-        if host or user:
-            _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
+        conflicting = [
+            flag
+            for flag, value in (
+                ("--host", host),
+                ("--user", user),
+                ("--port", port),
+                ("--key", key),
+            )
+            if value is not None
+        ]
+        if conflicting:
+            _fail(
+                f"A target name cannot be combined with {'/'.join(conflicting)}.",
+                [
+                    "Connection details come from the registered target.",
+                    "",
+                    *USAGE_HINTS,
+                    "",
+                    f"Change what is registered:  ssherpa target add {name} ...",
+                ],
+            )
         with _surface_errors():
             return get_target(name)
 
@@ -650,8 +674,6 @@ def _up_vm(
     클러스터의 크기를 그대로 따른다. 1 로 단정하면 3노드가 도는 호스트에서
     '1노드 준비됨' 이라고 보고하게 된다 (실측).
     """
-    if nodes is not None and nodes < 1:
-        _fail("--nodes must be at least 1")
     # 호스트에 직접 설치된 클러스터와는 공존할 수 없다. kubectl 이 쓸 6443 을
     # 호스트 모드는 자신이 듣고, vm 모드는 VM 으로 넘겨야 하기 때문이다.
     node_host = cluster.nodes_for_host_mode(target)[0]
@@ -793,6 +815,15 @@ def up(
     spreads it over that many VMs.
     """
     target = _load_target(name)
+
+    # 값이 말이 되는지를 모드보다 먼저 본다. 순서가 반대면 `--nodes 0` 이
+    # 호스트 모드에서 "--vm 을 붙이라" 는 안내를 받는데, 붙여도 거절이다 —
+    # 고칠 수 없는 명령을 시키는 안내가 된다.
+    if nodes is not None and nodes < 1:
+        _fail(
+            f"--nodes must be at least 1 (got {nodes})",
+            ["A cluster needs a node to run on."],
+        )
 
     if vm_mode:
         _up_vm(name, target, distro, nodes)

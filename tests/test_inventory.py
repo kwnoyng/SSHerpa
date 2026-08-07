@@ -148,6 +148,34 @@ class TestFileHandling:
     def test_env_override_is_honored(self, temp_inventory):
         assert inventory_path() == temp_inventory
 
+    def test_a_port_that_is_not_a_number_is_our_error(self, temp_inventory):
+        # 문서가 손으로 고쳐도 된다고 열어둔 파일이다. 잘못 적힌 값에
+        # int() 의 스택트레이스로 답하면 안 된다.
+        temp_inventory.write_text(
+            "all:\n  hosts:\n    lab-01:\n"
+            "      ansible_host: 10.0.0.1\n"
+            "      ansible_port: 'abc'\n"
+        )
+        with pytest.raises(InventoryError, match="not a number"):
+            get_target("lab-01")
+
+    def test_the_bad_port_error_says_where_to_fix_it(self, temp_inventory):
+        temp_inventory.write_text(
+            "all:\n  hosts:\n    lab-01:\n"
+            "      ansible_host: 10.0.0.1\n      ansible_port: []\n"
+        )
+        with pytest.raises(InventoryError) as excinfo:
+            list_targets()
+        assert str(temp_inventory) in str(excinfo.value)
+
+    def test_a_port_written_as_a_string_still_works(self, temp_inventory):
+        # YAML 에서 따옴표를 붙이는 건 흔한 일이고, 잘못은 아니다
+        temp_inventory.write_text(
+            "all:\n  hosts:\n    lab-01:\n"
+            "      ansible_host: 10.0.0.1\n      ansible_port: '2222'\n"
+        )
+        assert get_target("lab-01").port == 2222
+
     def test_parent_directory_is_created(self, tmp_path, monkeypatch):
         nested = tmp_path / "a" / "b" / "inventory.yml"
         monkeypatch.setenv("SSHERPA_INVENTORY", str(nested))

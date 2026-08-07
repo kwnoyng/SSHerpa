@@ -68,14 +68,31 @@ def _save_raw(data: dict) -> None:
 
 
 def _to_target(name: str, vars_: dict) -> Target:
-    port = vars_.get("ansible_port")
     return Target(
         name=name,
         host=vars_.get("ansible_host", ""),
         user=vars_.get("ansible_user"),
-        port=int(port) if port is not None else None,
+        port=_port_of(name, vars_.get("ansible_port")),
         key=vars_.get("ansible_ssh_private_key_file"),
     )
+
+
+def _port_of(name: str, port) -> Optional[int]:
+    """인벤토리의 포트 값을 읽는다. 숫자가 아니면 우리 말로 설명한다.
+
+    이 파일은 손으로 고쳐도 된다고 문서가 열어둔 파일이다. 그렇게 열어둔
+    이상 잘못 적힌 값은 예상 범위 안이고, 그때 나가야 할 것은 우리가 쓴
+    한 줄이지 int() 의 스택트레이스가 아니다.
+    """
+    if port is None:
+        return None
+    try:
+        return int(port)
+    except (TypeError, ValueError):
+        raise InventoryError(
+            f"Target '{name}' has an ansible_port that is not a number: {port!r}\n"
+            f"Fix it in {inventory_path()}"
+        ) from None
 
 
 def list_targets() -> list[Target]:
