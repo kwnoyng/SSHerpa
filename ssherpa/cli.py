@@ -29,6 +29,7 @@ from .inventory import (
     inventory_path,
     list_targets,
     remove_target,
+    update_target,
 )
 from .ssh import SSHError, Target, looks_like_option, run
 from .virt import VirtError
@@ -244,6 +245,64 @@ def target_add(
             (0, 0, 0, 2),
         )
     )
+    console.print(Padding(f"[dim]{inventory_path()}[/dim]", (0, 0, 0, 4)))
+    console.print()
+    console.print(Padding(f"[dim]Next:  ssherpa check {target.name}[/dim]", (0, 0, 0, 2)))
+    console.print()
+
+
+@target_app.command("update")
+def target_update(
+    name: str = typer.Argument(..., help="Registered target name"),
+    host: Optional[str] = typer.Option(
+        None, "--host", help="New IP, hostname, or ~/.ssh/config alias"
+    ),
+    user: Optional[str] = typer.Option(None, "--user", help="New SSH username"),
+    key: Optional[str] = typer.Option(None, "--key", help="New path to SSH private key"),
+    port: Optional[int] = typer.Option(None, "--port", help="New SSH port"),
+    unset: Optional[list[str]] = typer.Option(
+        None, "--unset", help="Clear a setting (user, port, key). Repeatable."
+    ),
+) -> None:
+    """Change a registered target's connection details. Does not connect.
+
+    Only what you pass is changed; everything else is left as it is. A
+    cloud host that gets a new address on every restart needs one flag,
+    not a remove and a re-add that would also drop the key and port.
+
+    Clearing is a separate flag on purpose: --unset port. Overloading a
+    value to also mean "erase this" is how things get erased by accident.
+    """
+    with _surface_errors():
+        target, changes = update_target(
+            name, host=host, user=user, port=port, key=key, unset=unset
+        )
+
+    console.print()
+    if not changes:
+        # 아무것도 안 바뀐 것을 '✓ 변경됨' 이라고 하면 거짓말이 된다.
+        console.print(
+            Padding(
+                f"[dim]{target.name} already had those values — nothing changed.[/dim]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
+        return
+
+    console.print(
+        Padding(
+            f"[green]✓[/green] [bold]{target.name}[/bold] updated  —  "
+            f"{target.endpoint()}",
+            (0, 0, 0, 2),
+        )
+    )
+    for change in changes:
+        before = "(unset)" if change.before is None else change.before
+        after = "(unset)" if change.after is None else change.after
+        console.print(
+            Padding(f"[dim]{change.field}:  {before}  →  {after}[/dim]", (0, 0, 0, 4))
+        )
     console.print(Padding(f"[dim]{inventory_path()}[/dim]", (0, 0, 0, 4)))
     console.print()
     console.print(Padding(f"[dim]Next:  ssherpa check {target.name}[/dim]", (0, 0, 0, 2)))

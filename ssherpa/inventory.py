@@ -10,6 +10,7 @@ OS, VM 목록, 스냅샷 목록 같은 '실제 상태'는 저장하지 않는다
 
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -27,8 +28,58 @@ HOST_OPTION_HINT = [
 ]
 
 
+PORT_MIN, PORT_MAX = 1, 65535
+
+
 class InventoryError(Exception):
     pass
+
+
+def _checked_host(host: str) -> str:
+    """주소로 쓸 수 있는 값인가.
+
+    add 와 update 가 같은 검사를 쓴다. 한쪽에만 두면 규칙이 갈라진다 —
+    실제로 갈라져 있었다: add 는 --port 0 을 말없이 버리고 update 는
+    그대로 적었다.
+
+    빈 값을 막는 이유는 --unset host 를 막는 이유와 같다. 그쪽에만 규칙을
+    적어두고 이 문으로 같은 상태를 만들 수 있으면, 코드가 지킨다고 말한
+    것을 안 지키는 셈이다.
+    """
+    if not host or not host.strip():
+        raise InventoryError(
+            "An address cannot be empty.\n"
+            "A target without an address is not a target."
+        )
+    if looks_like_option(host):
+        raise InventoryError(
+            f"'{host}' is not a valid address.\n" + "\n".join(HOST_OPTION_HINT)
+        )
+    return host
+
+
+def _checked_port(port: int) -> int:
+    """ssh 에 넘길 수 있는 포트인가.
+
+    0 이나 음수를 그대로 적어두면 이후 모든 명령이 `ssh -p 0` 으로 나가
+    영문 모를 실패를 한다. 값이 들어오는 자리에서 막는 편이 낫다.
+    """
+    if not PORT_MIN <= port <= PORT_MAX:
+        raise InventoryError(
+            f"'{port}' is not a valid port.\n"
+            f"A port is a number from {PORT_MIN} to {PORT_MAX}."
+        )
+    return port
+
+
+def _checked_text(flag: str, value: str) -> str:
+    """비어 있지 않은 값인가. 빈 값은 '안 적은 것' 과 뜻이 다르다."""
+    if not value.strip():
+        raise InventoryError(
+            f"--{flag} cannot be empty.\n"
+            "Omit it to let ~/.ssh/config decide."
+        )
+    return value
 
 
 def inventory_path() -> Path:
@@ -87,12 +138,21 @@ def _port_of(name: str, port) -> Optional[int]:
     if port is None:
         return None
     try:
-        return int(port)
+        number = int(port)
     except (TypeError, ValueError):
         raise InventoryError(
             f"Target '{name}' has an ansible_port that is not a number: {port!r}\n"
             f"Fix it in {inventory_path()}"
         ) from None
+    # 손으로 적은 값은 숫자이기만 해서는 안 된다 — 범위도 봐야 `ssh -p 0`
+    # 으로 나가는 일이 없다.
+    if not PORT_MIN <= number <= PORT_MAX:
+        raise InventoryError(
+            f"Target '{name}' has an ansible_port out of range: {number}\n"
+            f"A port is a number from {PORT_MIN} to {PORT_MAX}.\n"
+            f"Fix it in {inventory_path()}"
+        )
+    return number
 
 
 def list_targets() -> list[Target]:
@@ -124,28 +184,137 @@ def add_target(
             "letters, digits, '-', '_', '.'"
         )
 
-    if looks_like_option(host):
-        raise InventoryError(f"'{host}' is not a valid address.\n" + "\n".join(HOST_OPTION_HINT))
+    host = _checked_host(host)
 
     data = _load_raw()
     if name in data["all"]["hosts"]:
         raise InventoryError(
             f"'{name}' is already registered.\n"
-            f"Remove it first:  ssherpa target remove {name}"
+            f"Change it:  ssherpa target update {name} --host <address>\n"
+            f"Or start over:  ssherpa target remove {name}"
         )
 
     # 지정한 값만 기록한다. 안 적은 항목은 접속할 때 ~/.ssh/config 가 정한다.
+    #
+    # 'is not None' 이지 'if value' 가 아니다. 후자는 --port 0 을 말없이
+    # 버렸다 — 사용자가 적은 값이 오류도 없이 사라지는, 이 프로젝트가
+    # 0.5.3 에서 닫기로 한 바로 그 종류다.
     vars_: dict[str, object] = {"ansible_host": host}
-    if user:
-        vars_["ansible_user"] = user
-    if port:
-        vars_["ansible_port"] = port
-    if key:
-        vars_["ansible_ssh_private_key_file"] = key
+    if user is not None:
+        vars_["ansible_user"] = _checked_text("user", user)
+    if port is not None:
+        vars_["ansible_port"] = _checked_port(port)
+    if key is not None:
+        vars_["ansible_ssh_private_key_file"] = _checked_text("key", key)
 
     data["all"]["hosts"][name] = vars_
     _save_raw(data)
     return _to_target(name, vars_)
+
+
+VAR_OF = {
+    "host": "ansible_host",
+    "user": "ansible_user",
+    "port": "ansible_port",
+    "key": "ansible_ssh_private_key_file",
+}
+
+
+@dataclass
+class Change:
+    """바뀐 항목 하나. 사용자에게 무엇이 무엇으로 바뀌었는지 보이기 위한 것."""
+
+    field: str
+    before: Optional[object]
+    after: object
+
+
+UNSETTABLE = ("user", "port", "key")
+
+
+def update_target(
+    name: str,
+    host: Optional[str] = None,
+    user: Optional[str] = None,
+    port: Optional[int] = None,
+    key: Optional[str] = None,
+    unset: Optional[list[str]] = None,
+) -> tuple[Target, list[Change]]:
+    """등록된 타겟의 접속 정보를 고친다. 준 것만 바꾼다.
+
+    클라우드 랩은 껐다 켤 때마다 주소가 바뀐다. 그때마다 지웠다 다시
+    등록하게 하면, 그 사이 이름이 사라져서 다른 명령이 못 찾는 창이 생기고
+    적어두지 않은 항목(키·포트)까지 함께 날아간다.
+
+    비우는 것은 --unset 으로 따로 받는다. '값을 준 것' 과 '비우라는 것' 을
+    한 인자에 실으면(빈 문자열 같은 것) 실수로 지우는 길이 생긴다. 주소는
+    비울 수 없다 — 주소가 없는 타겟은 타겟이 아니다.
+    """
+    data = _load_raw()
+    if name not in data["all"]["hosts"]:
+        known = ", ".join(sorted(data["all"]["hosts"])) or "(none)"
+        raise InventoryError(
+            f"Target '{name}' not found.\nRegistered targets: {known}"
+        )
+
+    unset = list(unset or [])
+    for field in unset:
+        if field not in UNSETTABLE:
+            allowed = ", ".join(UNSETTABLE)
+            extra = (
+                "\nA target without an address is not a target."
+                if field == "host"
+                else ""
+            )
+            raise InventoryError(
+                f"Cannot unset '{field}'.\nYou can unset: {allowed}{extra}"
+            )
+
+    given = {"host": host, "user": user, "port": port, "key": key}
+    if all(value is None for value in given.values()) and not unset:
+        raise InventoryError(
+            f"Nothing to change for '{name}'.\n"
+            "Pass at least one of --host, --user, --port, --key, --unset."
+        )
+
+    both = [f for f in unset if given.get(f) is not None]
+    if both:
+        raise InventoryError(
+            f"--{both[0]} and --unset {both[0]} contradict each other.\n"
+            "Pass one or the other."
+        )
+
+    # add 와 같은 검사를 쓴다 — 들어오는 문이 둘이면 규칙도 하나여야 한다.
+    check = {
+        "host": _checked_host,
+        "user": lambda v: _checked_text("user", v),
+        "port": _checked_port,
+        "key": lambda v: _checked_text("key", v),
+    }
+
+    vars_ = dict(data["all"]["hosts"][name] or {})
+    changes = []
+
+    for field, value in given.items():
+        if value is None:
+            continue
+        value = check[field](value)
+        var = VAR_OF[field]
+        before = vars_.get(var)
+        if before == value:
+            continue  # 같은 값을 다시 쓴 것은 변경이 아니다
+        changes.append(Change(field=field, before=before, after=value))
+        vars_[var] = value
+
+    for field in unset:
+        var = VAR_OF[field]
+        if var not in vars_:
+            continue  # 이미 없는 것을 지우는 것은 변경이 아니다
+        changes.append(Change(field=field, before=vars_.pop(var), after=None))
+
+    data["all"]["hosts"][name] = vars_
+    _save_raw(data)
+    return _to_target(name, vars_), changes
 
 
 def remove_target(name: str) -> None:

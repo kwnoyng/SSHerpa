@@ -44,3 +44,8 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["F", "E", "I", "UP", "B", "SIM", "ARG"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer 는 이 자리의 값을 호출 시점에 실제 인자로 바꿔치기한다. 호출 사이에
+# 공유되는 가변 기본값이 아니라서 B008 이 경고하려는 상황이 아니다.
+extend-immutable-calls = ["typer.Option", "typer.Argument"]

@@ -14,6 +14,7 @@ from ssherpa.inventory import (
     inventory_path,
     list_targets,
     remove_target,
+    update_target,
 )
 
 
@@ -125,6 +126,223 @@ class TestListAndRemove:
         add_target("lab-01", host="10.0.0.1", user="admin")
         with pytest.raises(InventoryError, match="lab-01"):
             get_target("nope")
+
+
+class TestUpdate:
+    """클라우드 랩은 껐다 켤 때마다 주소가 바뀐다.
+
+    지웠다 다시 등록하게 하면 그 사이 이름이 사라지는 창이 생기고, 적어두지
+    않은 항목(키·포트)까지 함께 날아간다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def registered(self):
+        add_target("lab-01", host="10.0.0.10", user="admin", port=2222, key="~/k")
+
+    def test_only_the_address_changes(self):
+        target, _ = update_target("lab-01", host="34.22.105.223")
+        assert target.host == "34.22.105.223"
+        # 나머지는 그대로 — 이게 remove + add 와 다른 점이다
+        assert (target.user, target.port, target.key) == ("admin", 2222, "~/k")
+
+    def test_it_survives_a_reload(self, temp_inventory):
+        update_target("lab-01", host="34.22.105.223")
+        assert get_target("lab-01").host == "34.22.105.223"
+        assert "34.22.105.223" in temp_inventory.read_text(encoding="utf-8")
+
+    def test_several_fields_at_once(self):
+        target, changes = update_target("lab-01", host="10.0.0.20", port=22)
+        assert (target.host, target.port) == ("10.0.0.20", 22)
+        assert {c.field for c in changes} == {"host", "port"}
+
+    def test_it_reports_what_moved(self):
+        _, changes = update_target("lab-01", host="10.0.0.20")
+        assert len(changes) == 1
+        assert (changes[0].before, changes[0].after) == ("10.0.0.10", "10.0.0.20")
+
+    def test_setting_a_field_that_was_unset(self):
+        add_target("bare", host="10.0.0.30")
+        _, changes = update_target("bare", user="root")
+        assert changes[0].before is None
+        assert get_target("bare").user == "root"
+
+    def test_the_same_value_is_not_a_change(self):
+        # '✓ 바뀜' 이라고 해놓고 아무것도 안 바뀌면 거짓말이다
+        _, changes = update_target("lab-01", host="10.0.0.10")
+        assert changes == []
+
+    def test_nothing_given_is_refused(self):
+        with pytest.raises(InventoryError, match="Nothing to change"):
+            update_target("lab-01")
+
+    def test_an_unknown_target_is_refused(self):
+        with pytest.raises(InventoryError, match="not found"):
+            update_target("nope", host="10.0.0.1")
+
+    def test_an_option_like_address_is_refused(self):
+        # add 와 같은 방어 — ssh 가 목적지 대신 옵션으로 읽는다
+        with pytest.raises(InventoryError, match="not a valid address"):
+            update_target("lab-01", host="-oProxyCommand=evil")
+
+    def test_a_refused_update_changes_nothing(self):
+        with pytest.raises(InventoryError):
+            update_target("lab-01", host="-oProxyCommand=evil")
+        assert get_target("lab-01").host == "10.0.0.10"
+
+    def test_add_now_points_at_update(self):
+        with pytest.raises(InventoryError, match="target update"):
+            add_target("lab-01", host="10.0.0.99")
+
+
+class TestUnset:
+    """비우는 것은 따로 받는다 — 값에 '지워라' 를 겸하게 하면 실수로 지운다."""
+
+    @pytest.fixture(autouse=True)
+    def registered(self):
+        add_target("lab-01", host="10.0.0.10", user="admin", port=2222, key="~/k")
+
+    def test_a_setting_can_be_cleared(self):
+        target, changes = update_target("lab-01", unset=["port"])
+        assert target.port is None
+        assert (changes[0].field, changes[0].before, changes[0].after) == (
+            "port", 2222, None
+        )
+
+    def test_clearing_leaves_the_rest_alone(self):
+        target, _ = update_target("lab-01", unset=["port"])
+        assert (target.host, target.user, target.key) == ("10.0.0.10", "admin", "~/k")
+
+    def test_several_at_once(self):
+        target, changes = update_target("lab-01", unset=["port", "key"])
+        assert (target.port, target.key) == (None, None)
+        assert len(changes) == 2
+
+    def test_it_can_be_combined_with_a_change(self):
+        target, _ = update_target("lab-01", host="10.0.0.20", unset=["port"])
+        assert (target.host, target.port) == ("10.0.0.20", None)
+
+    def test_clearing_what_is_already_clear_is_not_a_change(self):
+        add_target("bare", host="10.0.0.30")
+        _, changes = update_target("bare", unset=["port"])
+        assert changes == []
+
+    def test_the_address_cannot_be_cleared(self):
+        # 주소가 없는 타겟은 타겟이 아니다
+        with pytest.raises(InventoryError, match="Cannot unset 'host'"):
+            update_target("lab-01", unset=["host"])
+
+    def test_an_unknown_field_is_refused(self):
+        with pytest.raises(InventoryError, match="You can unset"):
+            update_target("lab-01", unset=["distro"])
+
+    def test_setting_and_clearing_the_same_field_is_refused(self):
+        # 둘 중 하나를 조용히 이기게 하면 어느 쪽인지 알 수 없다
+        with pytest.raises(InventoryError, match="contradict"):
+            update_target("lab-01", port=22, unset=["port"])
+
+    def test_a_refused_unset_changes_nothing(self):
+        with pytest.raises(InventoryError):
+            update_target("lab-01", unset=["host"])
+        assert get_target("lab-01").port == 2222
+
+
+class TestPortIsChecked:
+    """0 과 음수는 포트가 아니다.
+
+    add 는 `if port:` 로 걸러서 --port 0 을 말없이 버렸고, update 는
+    `is not None` 이라 0 을 그대로 적었다. 같은 입력에 두 동작이었고 어느
+    쪽도 유효한 포트가 아니다. 버리는 쪽이 특히 나쁘다 — 사용자가 적은
+    값이 오류도 없이 사라진다.
+    """
+
+    @pytest.mark.parametrize("bad", [0, -1, -22, 65536, 99999])
+    def test_add_refuses(self, bad):
+        with pytest.raises(InventoryError, match="not a valid port"):
+            add_target("lab-01", host="10.0.0.1", port=bad)
+
+    @pytest.mark.parametrize("bad", [0, -1, 65536])
+    def test_update_refuses(self, bad):
+        add_target("lab-01", host="10.0.0.1")
+        with pytest.raises(InventoryError, match="not a valid port"):
+            update_target("lab-01", port=bad)
+
+    @pytest.mark.parametrize("good", [1, 22, 2222, 65535])
+    def test_the_usable_range_still_works(self, good):
+        add_target("lab-01", host="10.0.0.1", port=good)
+        assert get_target("lab-01").port == good
+
+    def test_a_refused_port_is_not_written(self):
+        with pytest.raises(InventoryError):
+            add_target("lab-01", host="10.0.0.1", port=0)
+        assert list_targets() == []
+
+    def test_a_refused_update_leaves_the_old_port(self):
+        add_target("lab-01", host="10.0.0.1", port=2222)
+        with pytest.raises(InventoryError):
+            update_target("lab-01", port=0)
+        assert get_target("lab-01").port == 2222
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "70000"])
+    def test_a_hand_edited_file_is_caught_too(self, temp_inventory, bad):
+        # 숫자이기만 해서는 안 된다 — 그대로 두면 `ssh -p 0` 으로 나간다
+        temp_inventory.write_text(
+            "all:\n  hosts:\n    lab-01:\n"
+            f"      ansible_host: 10.0.0.1\n      ansible_port: '{bad}'\n"
+        )
+        with pytest.raises(InventoryError, match="out of range"):
+            get_target("lab-01")
+
+
+class TestEmptyValuesAreRefused:
+    """빈 값은 '안 적은 것' 과 뜻이 다르다.
+
+    --unset host 는 "A target without an address is not a target." 로
+    막는데, --host "" 는 정확히 그 상태를 만들 수 있었다. 규칙을 말로
+    적어놓고 옆문을 열어두면 그 규칙은 없는 것이다.
+    """
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_add_refuses_an_empty_address(self, blank):
+        with pytest.raises(InventoryError, match="cannot be empty"):
+            add_target("lab-01", host=blank)
+
+    @pytest.mark.parametrize("blank", ["", "  "])
+    def test_update_refuses_an_empty_address(self, blank):
+        add_target("lab-01", host="10.0.0.1")
+        with pytest.raises(InventoryError, match="cannot be empty"):
+            update_target("lab-01", host=blank)
+
+    def test_the_reason_matches_the_unset_guard(self):
+        # 같은 규칙이면 같은 말로 거절해야 한다
+        with pytest.raises(InventoryError) as add_err:
+            add_target("lab-01", host="")
+        add_target("lab-01", host="10.0.0.1")
+        with pytest.raises(InventoryError) as unset_err:
+            update_target("lab-01", unset=["host"])
+        shared = "A target without an address is not a target."
+        assert shared in str(add_err.value)
+        assert shared in str(unset_err.value)
+
+    @pytest.mark.parametrize("field", ["user", "key"])
+    def test_add_refuses_other_empty_values(self, field):
+        with pytest.raises(InventoryError, match="cannot be empty"):
+            add_target("lab-01", host="10.0.0.1", **{field: ""})
+
+    @pytest.mark.parametrize("field", ["user", "key"])
+    def test_update_refuses_other_empty_values(self, field):
+        add_target("lab-01", host="10.0.0.1")
+        with pytest.raises(InventoryError, match="cannot be empty"):
+            update_target("lab-01", **{field: ""})
+
+    def test_omitting_is_still_how_you_leave_it_to_ssh_config(self):
+        # 빈 값을 막는다고 '안 적기' 까지 막으면 안 된다
+        add_target("lab-01", host="10.0.0.1")
+        target = get_target("lab-01")
+        assert (target.user, target.port, target.key) == (None, None, None)
+
+    def test_an_option_like_address_is_still_refused(self):
+        with pytest.raises(InventoryError, match="not a valid address"):
+            add_target("lab-01", host="-oProxyCommand=evil")
 
 
 class TestFileHandling:

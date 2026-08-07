@@ -64,6 +64,14 @@ ssherpa check lab-01
   lab-01 is ready
 ```
 
+A cloud host usually gets a new address every time it is restarted. Change
+the one thing that moved, rather than removing and re-adding the target —
+that would also drop the key and port you had set:
+
+```bash
+ssherpa target update lab-01 --host 10.0.0.11
+```
+
 `check` opens a short-lived SSH connection, runs a few probes, and
 disconnects. It exits `0` when every check passes and `1` otherwise, so it
 composes with scripts. When something is wrong, it says what to do about it:
@@ -391,6 +399,7 @@ Extra arguments are passed straight to `ssh`.
 | Command | Connects over SSH |
 |---|---|
 | `ssherpa target add <NAME> --host <IP\|alias> [--user <USER>] [--key <PATH>] [--port <N>]` | no |
+| `ssherpa target update <NAME> [--host ...] [--user ...] [--key ...] [--port ...] [--unset <FIELD>]` | no |
 | `ssherpa target list` | no |
 | `ssherpa target remove <NAME>` | no |
 | `ssherpa check <NAME>` (or `--host` for one-off) | yes |
