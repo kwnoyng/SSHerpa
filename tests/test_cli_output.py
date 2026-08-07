@@ -1149,3 +1149,23 @@ class TestLeftoverForwardingIsRemovable:
             cli.down("lab-01", assume_yes=True)
         assert "Nothing is installed" in captured.get()
         assert closed == []
+
+
+class TestSourceEncoding:
+    def test_no_source_file_carries_a_bom(self):
+        # 실측: PowerShell 의 Set-Content -Encoding utf8 이 BOM 을 붙이고,
+        # Get-Content 는 UTF-8 을 cp949 로 읽어 한글 docstring 을 통째로
+        # 깨뜨렸다. 소스는 BOM 없는 UTF-8 이어야 한다.
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "ssherpa"
+        for source in sorted(root.glob("*.py")):
+            raw = source.read_bytes()
+            assert not raw.startswith(b"\xef\xbb\xbf"), f"{source.name} has a BOM"
+            raw.decode("utf-8")  # 깨진 인코딩이면 여기서 터진다
+
+    def test_the_package_docstring_is_not_mojibake(self):
+        import ssherpa
+
+        # cp949 왕복으로 깨지면 한글이 '?곕Ⅴ??' 류의 잔해가 된다
+        assert "셰르파" in (ssherpa.__doc__ or "")
