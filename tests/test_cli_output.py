@@ -260,6 +260,178 @@ class TestStatusSurvivesALostConnection:
         assert "running" in out
 
 
+class TestStatusLeadsWithTheAnswer:
+    """VM 클러스터가 도는 호스트에서 'k3s — not installed' 두 줄이 먼저
+    나오면, 멀쩡한 클러스터 앞에서 아무것도 없다는 인상을 준다 (실사용
+    지적). 답을 먼저, '없음'은 마지막에.
+    """
+
+    def _wire(self, monkeypatch, *, vms, host_installed, inside_running):
+        from ssherpa import cli
+        from ssherpa.cluster import DistroStatus, HostStatus
+        from ssherpa.ssh import Target
+        from ssherpa.vm import VmInfo
+
+        target = Target(name="lab-01", host="192.0.2.10")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+
+        def status(node, _known):
+            if getattr(node, "in_vm", False):
+                return HostStatus(
+                    distros=[
+                        DistroStatus("k3s", installed=False, service_state=""),
+                        DistroStatus(
+                            "rke2",
+                            installed=inside_running,
+                            service_state="active" if inside_running else "",
+                        ),
+                    ],
+                    node_lines=(
+                        ["node-1 Ready control-plane 5m v1"] if inside_running else []
+                    ),
+                )
+            return HostStatus(
+                distros=[
+                    DistroStatus(
+                        "k3s",
+                        installed=host_installed,
+                        service_state="active" if host_installed else "",
+                    ),
+                    DistroStatus("rke2", installed=False, service_state=""),
+                ]
+            )
+
+        monkeypatch.setattr(cli.cluster, "status", status)
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: list(vms))
+        monkeypatch.setattr(cli.vm_mod, "vm_state", lambda *_a, **_k: "running")
+        monkeypatch.setattr(
+            cli.vm_mod,
+            "find",
+            lambda *_a, **_k: (
+                VmInfo(vms[0], "192.168.122.10", "52:54:00:00:00:01", True)
+                if vms
+                else None
+            ),
+        )
+        monkeypatch.setattr(
+            cli.vm_mod,
+            "vm_target",
+            lambda _h, info: Target(name=f"vm/{info.name}", host=info.ip),
+        )
+        return cli
+
+    def test_a_vm_cluster_is_not_announced_with_not_installed(self, monkeypatch):
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=False,
+            inside_running=True,
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "not installed" not in out
+        assert "rke2 in the VMs" in out
+
+    def test_the_cluster_line_comes_before_the_vm_list(self, monkeypatch):
+        # 답(클러스터)이 목록(VM)보다 먼저다
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=False,
+            inside_running=True,
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert out.index("cluster:") < out.index("vm:")
+
+    def test_the_hosts_cleanliness_is_still_stated(self, monkeypatch):
+        # 표를 걷어낸 자리의 정보는 남는다 — 호스트 직접 설치가 없다는
+        # 사실은 down/up 의 동작을 예측하는 데 쓰인다
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=False,
+            inside_running=True,
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        assert "host itself has nothing installed" in captured.get()
+
+    def test_an_empty_host_keeps_the_table(self, monkeypatch):
+        # 아무것도 없을 때는 'not installed' 가 곧 답이다
+        cli = self._wire(
+            monkeypatch, vms=[], host_installed=False, inside_running=False
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "not installed" in out
+        assert "Nothing installed" in out
+
+    def test_a_host_mode_install_keeps_the_table(self, monkeypatch):
+        cli = self._wire(
+            monkeypatch, vms=[], host_installed=True, inside_running=False
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "k3s" in out
+        assert "installed" in out
+
+    def test_a_host_install_beside_vms_is_called_a_fight(self, monkeypatch):
+        # SSHerpa 는 이 상태를 만들지 않는다 — 손으로 깔았을 때만 생긴다.
+        # 둘 다 초록불로 보여주면 6443 싸움이 숨는다: 포워딩이 바깥
+        # 트래픽을 VM 으로 보내므로 호스트 쪽은 밖에서 조용히 끊긴다.
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=True,
+            inside_running=True,
+        )
+        with (
+            cli.console.capture() as out_cap,
+            cli.err_console.capture() as err_cap,
+        ):
+            cli.status("lab-01")
+        assert "both need port 6443" in err_cap.get()
+        assert "cut off" in err_cap.get()
+        # 둘 다 사실대로 보인다 — 경고는 추가지 은폐가 아니다
+        assert "k3s" in out_cap.get()
+        assert "rke2 in the VMs" in out_cap.get()
+
+    def test_the_fight_warning_suggests_a_command_that_exists(self, monkeypatch):
+        # 예전 충돌 안내는 down --distro 를 권했는데 down 에 그 옵션이 없다.
+        # 안내가 시키는 명령은 실행 가능해야 한다.
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=True,
+            inside_running=True,
+        )
+        with cli.console.capture(), cli.err_console.capture() as err_cap:
+            cli.status("lab-01")
+        err = err_cap.get()
+        assert "ssherpa down lab-01" in err
+        assert "down lab-01 --distro" not in err
+
+    def test_empty_vms_are_not_reported_as_no_cluster(self, monkeypatch):
+        # VM 은 있는데 안이 비었다 — 만들다 만 상태. 침묵하면 '클러스터가
+        # 없다' 로 읽히므로, 상태와 다음 걸음을 그대로 말한다.
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=False,
+            inside_running=False,
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "nothing installed in the VMs yet" in out
+        assert "up lab-01 --vm" in out
+
+
 class TestDistroSelection:
     """빈 호스트에서만 고를 일이 생긴다: 사람은 화살표, 스크립트는 --distro,
     지정 없는 스크립트는 k3s 기본 + 그 사실을 로그에 남긴다."""

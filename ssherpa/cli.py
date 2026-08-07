@@ -1170,38 +1170,37 @@ def status(
                 # 꺼져 있을 때 아무 줄도 나오지 않았다).
                 unreachable = exc.message
 
-    table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
-    table.add_column(no_wrap=True, style="bold")
-    table.add_column(no_wrap=True)
-    table.add_column(overflow="fold")
-    where = " on the host" if vms else ""
-    for entry in host.distros:
-        if not entry.installed:
-            table.add_row(entry.name, "[dim]—[/dim]", f"[dim]not installed{where}[/dim]")
-            continue
-        colour = "green" if entry.running else "yellow"
-        state = entry.service_state or "unknown"
-        table.add_row(entry.name, "[green]✓[/green]", f"installed  [{colour}]{state}[/{colour}]")
-
     console.print()
     console.print(Padding(f"Status of [bold]{name}[/bold]", (0, 0, 0, 2)))
     console.print()
-    console.print(Padding(table, (0, 0, 0, 2)))
-    console.print()
 
-    if vms:
-        for index, (vm_name, state) in enumerate(vms):
-            colour = "green" if state == "running" else "yellow"
-            label = "[dim]vm:[/dim]" if index == 0 else "   "
-            console.print(
-                Padding(
-                    f"{label}  {vm_name}  [{colour}]{state or 'unknown'}[/{colour}]",
-                    (0, 0, 0, 2),
+    # 답부터 말한다. VM 클러스터가 있는 호스트에서 'k3s — not installed'
+    # 두 줄을 먼저 내밀면, 멀쩡히 도는 클러스터 앞에서 아무것도 없다는
+    # 인상을 준다 (실사용 지적). 배포판 표는 호스트에 직접 깔렸거나
+    # VM 이 아예 없을 때만 답이다.
+    if host.installed or not vms:
+        table = Table(
+            box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0)
+        )
+        table.add_column(no_wrap=True, style="bold")
+        table.add_column(no_wrap=True)
+        table.add_column(overflow="fold")
+        where = " on the host" if vms else ""
+        for entry in host.distros:
+            if not entry.installed:
+                table.add_row(
+                    entry.name, "[dim]—[/dim]", f"[dim]not installed{where}[/dim]"
                 )
+                continue
+            colour = "green" if entry.running else "yellow"
+            state = entry.service_state or "unknown"
+            table.add_row(
+                entry.name, "[green]✓[/green]", f"installed  [{colour}]{state}[/{colour}]"
             )
+        console.print(Padding(table, (0, 0, 0, 2)))
         console.print()
 
-    # VM 안에서 도는 클러스터를 한 줄로 요약한다.
+    # VM 안에서 도는 클러스터를 한 줄로 요약한다 — VM 이 있으면 이게 답이다.
     if inside is not None and inside.running:
         running = inside.running[0].name
         ready = inside.ready_count
@@ -1212,6 +1211,31 @@ def status(
             Padding(
                 f"[dim]cluster:[/dim]  {running} in the VMs  "
                 f"[{colour}]{shape}[/{colour}]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
+    elif inside is not None and inside.installed:
+        # 깔려는 있는데 안 돈다 — '없다' 도 '준비됨' 도 아닌 상태를
+        # 그대로 말해야 사용자가 맞는 다음 걸음을 찾는다.
+        entry = inside.installed[0]
+        state = entry.service_state or "not running"
+        console.print(
+            Padding(
+                f"[dim]cluster:[/dim]  {entry.name} in the VMs  "
+                f"[yellow]{state}[/yellow]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
+    elif inside is not None:
+        # VM 은 있는데 안이 비었다 — 만들다 만 상태. 침묵하면
+        # '클러스터가 없다' 로 읽힌다.
+        console.print(
+            Padding(
+                f"[dim]cluster:[/dim]  [yellow]nothing installed in the VMs "
+                f"yet[/yellow]  [dim]ssherpa up {name} --vm finishes the "
+                "job[/dim]",
                 (0, 0, 0, 2),
             )
         )
@@ -1231,9 +1255,62 @@ def status(
         )
         console.print()
 
+    if vms:
+        for index, (vm_name, state) in enumerate(vms):
+            colour = "green" if state == "running" else "yellow"
+            label = "[dim]vm:[/dim]" if index == 0 else "   "
+            console.print(
+                Padding(
+                    f"{label}  {vm_name}  [{colour}]{state or 'unknown'}[/{colour}]",
+                    (0, 0, 0, 2),
+                )
+            )
+        console.print()
+        if not host.installed:
+            # 표를 걷어낸 자리의 정보는 남긴다 — 호스트 직접 설치가
+            # 없다는 사실은 down/up 의 동작을 예측하는 데 쓰인다.
+            console.print(
+                Padding(
+                    "[dim]The host itself has nothing installed — "
+                    "the cluster lives in the VMs.[/dim]",
+                    (0, 0, 0, 2),
+                )
+            )
+            console.print()
+
+    if host.installed and vms:
+        # SSHerpa 는 이 상태를 만들지 않는다 — up 은 양쪽 문에서 거절한다.
+        # 그러니 여기 왔다는 건 누가 손으로 깔았다는 뜻이고, 둘 다 초록불로
+        # 보여주면 6443 을 두고 싸우는 중이라는 사실이 숨는다: 포워딩이
+        # 바깥 트래픽을 VM 으로 보내므로 호스트 쪽 설치는 밖에서 조용히
+        # 끊긴다.
+        err_console.print(
+            Padding(
+                f"[yellow]{host.installed[0].name} on the host and the VM "
+                "cluster both need port 6443.[/yellow]",
+                (0, 0, 0, 2),
+            )
+        )
+        err_console.print()
+        err_console.print(
+            Padding(
+                "The host forwards that port into the VMs, so from outside "
+                "kubectl reaches",
+                (0, 0, 0, 4),
+            )
+        )
+        err_console.print(
+            Padding(
+                f"the VM cluster — the host's {host.installed[0].name} is cut "
+                "off. Start clean:",
+                (0, 0, 0, 4),
+            )
+        )
+        err_console.print(Padding(f"[dim]ssherpa down {name}[/dim]", (0, 0, 0, 8)))
+        err_console.print()
+
     if host.conflicted:
         # 두 배포판이 함께 있으면 둘 다 6443 을 잡으려 해서 나중 것이 못 뜬다.
-        extra = [d.name for d in host.installed if not d.running]
         err_console.print(
             Padding(
                 "[yellow]More than one distribution is installed.[/yellow]",
@@ -1243,14 +1320,29 @@ def status(
         err_console.print()
         err_console.print(
             Padding(
-                "They all bind port 6443, so only one can run. Remove the others:",
+                # down 은 골라서 지우지 않는다 — 찾은 것을 전부 걷는다.
+                # 배포판을 골라 지우라는 안내는 down 에 없는 옵션을 시키는
+                # 것이었다 (--distro 는 up 의 옵션이다).
+                "They all bind port 6443, so only one can run. down removes "
+                "everything",
                 (0, 0, 0, 4),
             )
         )
-        for other in extra or [d.name for d in host.installed[1:]]:
-            err_console.print(
-                Padding(f"[dim]ssherpa down {name} --distro {other}[/dim]", (0, 0, 0, 8))
+        err_console.print(
+            Padding(
+                "it finds — start clean, then put back the one you want:",
+                (0, 0, 0, 4),
             )
+        )
+        err_console.print(Padding(f"[dim]ssherpa down {name}[/dim]", (0, 0, 0, 8)))
+        err_console.print(
+            Padding(
+                # <> 는 자리표시자 관례다 — 따옴표 없는 | 를 그대로 내면
+                # 붙여넣는 순간 셸이 파이프로 읽는다.
+                f"[dim]ssherpa up {name} --distro <{distro_mod.names().replace(', ', '|')}>[/dim]",
+                (0, 0, 0, 8),
+            )
+        )
         err_console.print()
     elif not host.installed and not vms:
         console.print(Padding(f"[dim]Nothing installed.  ssherpa up {name}[/dim]", (0, 0, 0, 2)))
