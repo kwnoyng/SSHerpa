@@ -41,6 +41,23 @@ class TestNameAndConnectionFlags:
         err = capsys.readouterr().err
         assert "--port" in err and "--key" in err
 
+    def test_the_fix_points_at_update_not_add(self, capsys):
+        # add 를 시키면 '이미 등록됨' 거절이 다시 update 를 가리킨다 —
+        # 안내가 원을 그리면 두 번 실패하고서야 도착한다
+        with pytest.raises(typer.Exit):
+            resolve(name="lab-01", port=2222)
+        err = capsys.readouterr().err
+        assert "target update lab-01" in err
+        assert "target add" not in err
+
+    def test_hints_speak_the_command_that_was_run(self, capsys):
+        # doctor 의 오류가 check 를 시키면 사용자는 엉뚱한 명령을 배운다
+        with pytest.raises(typer.Exit):
+            resolve(verb="doctor")
+        err = capsys.readouterr().err
+        assert "ssherpa doctor" in err
+        assert "ssherpa check" not in err
+
     def test_a_bare_name_still_resolves(self):
         target = resolve(name="lab-01")
         assert (target.host, target.user) == ("10.0.0.10", "admin")

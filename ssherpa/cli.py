@@ -65,10 +65,13 @@ app = typer.Typer(
 target_app = typer.Typer(help="Manage targets (server address book).", no_args_is_help=True)
 app.add_typer(target_app, name="target")
 
-USAGE_HINTS = [
-    "Registered target:   ssherpa check lab-01",
-    "One-off check:       ssherpa check --host 10.0.0.10 --user admin",
-]
+def _usage_hints(verb: str) -> list[str]:
+    """인자 사용법 안내. 명령 이름은 지금 실행한 그 명령으로 적는다 —
+    doctor 의 오류가 check 를 시키면 사용자는 엉뚱한 명령을 배운다."""
+    return [
+        f"Registered target:   ssherpa {verb} lab-01",
+        f"One-off host:        ssherpa {verb} --host 10.0.0.10 --user admin",
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -129,6 +132,7 @@ def _resolve_target(
     user: Optional[str],
     port: Optional[int],
     key: Optional[str],
+    verb: str = "check",
 ) -> Target:
     """등록된 타겟 이름이든 일회성 --host 든 하나의 Target 으로 만든다.
 
@@ -157,16 +161,18 @@ def _resolve_target(
                 [
                     "Connection details come from the registered target.",
                     "",
-                    *USAGE_HINTS,
+                    *_usage_hints(verb),
                     "",
-                    f"Change what is registered:  ssherpa target add {name} ...",
+                    # add 를 시키면 '이미 등록됨' 거절이 다시 update 를
+                    # 가리킨다 — 안내가 원을 그리면 두 번 실패하고 도착한다.
+                    f"Change what is registered:  ssherpa target update {name} ...",
                 ],
             )
         with _surface_errors():
             return get_target(name)
 
     if not host:
-        _fail("A target name or --host is required.", USAGE_HINTS)
+        _fail("A target name or --host is required.", _usage_hints(verb))
     if looks_like_option(host):
         _fail(f"'{host}' is not a valid address.", HOST_OPTION_HINT)
     return Target(name=None, host=host, user=user, port=port, key=key)
@@ -388,7 +394,7 @@ def doctor(
     "can this host create VMs". A host that fails here can still run
     host-mode clusters — the verdict says which way to go.
     """
-    target = _resolve_target(name, host, user, port, key)
+    target = _resolve_target(name, host, user, port, key, verb="doctor")
 
     with _surface_errors():
         result = run(target, doctor_mod.DOCTOR_PROBE, timeout=60)
@@ -460,7 +466,7 @@ def check(
     It does not leave a session open.
     """
     # 인벤토리에 등록된 타겟이든, 일회성 --host 든 둘 다 받는다.
-    target = _resolve_target(name, host, user, port, key)
+    target = _resolve_target(name, host, user, port, key, verb="check")
 
     label = target.name or target.host
 
