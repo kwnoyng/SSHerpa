@@ -5,7 +5,7 @@
 
 Build Kubernetes labs on a single on-premises server, over nothing but SSH.
 
-> **v0.5** — register a host, check that it is ready, and stand up a
+> **v0.6** — register a host, check that it is ready, and stand up a
 > Kubernetes cluster on it: directly on the host (k3s or RKE2), or spread
 > over VMs on it (`up --vm --nodes 3`) — wired into your `~/.kube/config`.
 > One server, a real multi-node cluster.
@@ -17,7 +17,8 @@ Build Kubernetes labs on a single on-premises server, over nothing but SSH.
 | Your machine | Python 3.9+, an OpenSSH client |
 | Target host | Ubuntu 22.04 / 24.04, Rocky 9, or AlmaLinux 9 |
 | Access | SSH key-based login and passwordless `sudo` |
-| Memory | ~1 GB for k3s, ~4 GB for RKE2 |
+| Memory (host mode) | ~1 GB for k3s, ~4 GB for RKE2 |
+| Memory (VM mode) | per VM: 2 GB (k3s) / 4 GB (RKE2), plus ~1.5 GB the host keeps — `ssherpa doctor` does this math |
 | VM mode | hardware virtualization on the host — `ssherpa doctor` tells you |
 
 Windows 10/11, macOS, and most Linux distributions ship an OpenSSH client
@@ -131,8 +132,8 @@ On an empty host you pick a distribution with the arrow keys:
 
 ```
 ? Which Kubernetes distribution?
-❯ k3s    lightweight, installs in about 20s, runs in 1 GB
-  rke2   security-hardened, closer to production, needs 4 GB
+❯ k3s    lightweight, installs in about 20s — needs ~1 GB
+  rke2   security-hardened, closer to production — needs ~4 GB
 ```
 
 then each step reports as it completes:
@@ -218,6 +219,9 @@ distribution you chose goes in:
 
 Worth knowing:
 
+- **Both distributions run in VM mode** — pass `--distro rke2` (or answer
+  the prompt) and the full hardened RKE2 stack goes into the VM, separate
+  etcd and all. Up to v0.5 this was k3s-only.
 - **The VM's size follows the distribution** — 2 GB and a 10 GB thin disk
   for k3s, 4 GB and 20 GB for RKE2, always Ubuntu 24.04 with 2 CPUs inside.
   The host's OS is whatever you were given; the VM's OS is a part SSHerpa
@@ -348,14 +352,13 @@ host itself could have corrected:
 ```
   Status of lab-01
 
-  k3s   —  not installed on the host
-  rke2  —  not installed on the host
+  cluster:  k3s in the VMs  3/3 nodes Ready
 
   vm:  ssherpa-node-1  running
        ssherpa-node-2  running
        ssherpa-node-3  running
 
-  cluster:  k3s in the VMs  3/3 nodes Ready
+  The host itself has nothing installed — the cluster lives in the VMs.
 ```
 
 ```bash
