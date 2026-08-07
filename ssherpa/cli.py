@@ -590,7 +590,49 @@ def _load_target(name: str) -> Target:
         return get_target(name)
 
 
-def _print_up_result(result, distro_name: str, target: Target) -> None:
+def _kubectl_with_config(path) -> str:
+    """kubeconfig 를 환경변수로 얹어 kubectl 을 부르는 한 줄.
+
+    이 명령을 붙여넣는 곳은 원격 호스트가 아니라 사용자의 터미널이다.
+    문법은 그쪽 셸이 정하므로, 원격 명령과 달리 여기서만 OS 를 본다.
+    """
+    if os.name == "nt":
+        return f'$env:KUBECONFIG="{path}"; kubectl'
+    return f"KUBECONFIG={path} kubectl"
+
+
+def _print_forwarding_exposure(target: Target) -> None:
+    """VM 모드가 열어둔 길이 무엇을 지나가는지 밝힌다.
+
+    호스트의 6443 을 VM 으로 넘기는 규칙은 FORWARD 체인 맨 앞에 들어간다.
+    libvirt 의 거부 규칙보다 앞서야 해서 그런데, 그 자리는 ufw/firewalld 의
+    규칙보다도 앞이다. 게다가 넘겨지는 패킷에는 INPUT 규칙이 적용되지
+    않는다 — 호스트가 6443 을 INPUT 에서 막고 있어도 VM 의 API 는 열린다.
+
+    막힌 것을 알려주는 안내는 이미 있는데, 정작 위험한 쪽은 열린 쪽이다.
+    사용자가 호스트 방화벽을 믿고 있다면 그 믿음이 여기서 틀린다.
+
+    과장하지는 않는다: 클라우드나 네트워크 방화벽은 호스트 바깥이라
+    그대로 유효하다. 우회되는 것은 호스트의 iptables 층뿐이다.
+    """
+    where = target.name or target.host
+    _say()
+    _say(
+        f"[yellow]Note: port {cluster.API_PORT} on the host now reaches the "
+        "VM's API server.[/yellow]"
+    )
+    for line in (
+        "The rule sits ahead of the host's own firewall (ufw, firewalld),",
+        "and forwarded traffic never passes INPUT, so blocking 6443 there",
+        "will not close this. Firewalls upstream of the host still apply.",
+        f"Close it with:  ssherpa down {where}",
+    ):
+        _say(f"[dim]{line}[/dim]", indent=4)
+
+
+def _print_up_result(
+    result, distro_name: str, target: Target, *, via_vm: bool = False
+) -> None:
     """up 의 결과 요약과 다음 할 일 안내.
 
     ~/.kube/config 병합 결과에 따라 kubectl 사용법이 셋으로 갈린다:
@@ -615,7 +657,7 @@ def _print_up_result(result, distro_name: str, target: Target) -> None:
     if result.merge_error:
         _say(f"[yellow]Could not update ~/.kube/config: {result.merge_error}[/yellow]")
         _say("Use the standalone file instead:", indent=4)
-        kubectl = f'$env:KUBECONFIG="{result.kubeconfig}"; kubectl'
+        kubectl = _kubectl_with_config(result.kubeconfig)
     elif result.context_is_current:
         _say(
             f"[dim]Added to ~/.kube/config as context "
@@ -634,6 +676,8 @@ def _print_up_result(result, distro_name: str, target: Target) -> None:
     if result.api_reachable:
         _say("Use it from any terminal:")
         _say(f"[dim]{kubectl} get nodes[/dim]", indent=4)
+        if via_vm:
+            _print_forwarding_exposure(target)
     else:
         # 포트가 막힌 것은 흔한 정상 상황이다. 실패로 처리하지 않고 방법을 안내한다.
         _say(f"[yellow]Port {cluster.API_PORT} is not reachable from here.[/yellow]")
@@ -783,7 +827,7 @@ def _up_vm(
             server, chosen, reporter, api_address=target.host, agents=agents
         )
 
-    _print_up_result(result, chosen.name, target)
+    _print_up_result(result, chosen.name, target, via_vm=True)
 
 
 @app.command("up")
