@@ -90,10 +90,17 @@ class Distro:
           - 표식이 있다        -> 우리가 썼다
           - tls-san 만 있다    -> 표식을 남기기 전(0.5.0 이하) 우리가 쓴 모양
           - 그 밖의 내용이 있다 -> 남의 파일. 덮어쓰면 안 된다.
+
+        세 줄 다 sudo 로 묻는다. 우리 권한이 모자라 못 읽은 것을 '없다'
+        거나 '표식이 없다' 로 읽으면, 이 검사가 막으려던 사고를 검사
+        자신이 일으킨다 — 디렉터리가 0700 이면 첫 줄이 '파일 없음' 으로
+        읽혀 남의 파일을 덮어쓰고, 파일이 0600 이면 둘째 줄이 실패해
+        우리가 쓴 파일을 남의 것으로 오판한다. CIS 하드닝 가이드가
+        쿠버네티스 설정 파일에 0600 을 요구하므로 드문 상태가 아니다.
         """
         return (
-            f"test -f {self.config_path} || {{ echo {CONFIG_OURS}; exit 0; }}\n"
-            f"grep -qF '{CONFIG_MARKER}' {self.config_path} 2>/dev/null "
+            f"sudo test -f {self.config_path} || {{ echo {CONFIG_OURS}; exit 0; }}\n"
+            f"sudo grep -qF '{CONFIG_MARKER}' {self.config_path} 2>/dev/null "
             f"&& {{ echo {CONFIG_OURS}; exit 0; }}\n"
             # tls-san 키와 그 목록, 빈 줄 말고 다른 것이 있으면 남의 파일이다
             f"if sudo grep -vE '^(tls-san:[[:space:]]*|[[:space:]]+-[[:space:]].*|"
@@ -142,10 +149,14 @@ class Distro:
         ]
 
     def status_command(self) -> str:
-        """설치 여부와 서비스 상태를 한 줄로 보고한다."""
+        """설치 여부와 서비스 상태를 한 줄로 보고한다.
+
+        존재 확인도 sudo 로 한다 — 못 읽은 것과 없는 것은 다른 사실이고,
+        뭉뚱그리면 도는 클러스터를 두고 '설치 안 됨' 이라 답하게 된다.
+        """
         return (
             f'printf "SSHERPA_D {self.name} %s %s\\n" '
-            f'"$(test -x {self.installed_marker} && echo yes || echo no)" '
+            f'"$(sudo test -x {self.installed_marker} && echo yes || echo no)" '
             f'"$(systemctl is-active {self.service} 2>/dev/null || true)"'
         )
 

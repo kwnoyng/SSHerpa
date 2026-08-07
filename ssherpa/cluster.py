@@ -115,7 +115,12 @@ def _run_step(node: Node, step: Step) -> CommandResult:
 
 
 def is_installed(node: Node, distro: Distro) -> bool:
-    result = run(node.target, f"test -x {distro.installed_marker}")
+    """이미 설치돼 있는가.
+
+    sudo 로 묻는다. 권한이 모자라 못 읽은 것을 '없다' 로 읽으면 up 이
+    도는 클러스터 위에 설치를 다시 건다.
+    """
+    result = run(node.target, f"sudo test -x {distro.installed_marker}")
     return result.rc == 0
 
 

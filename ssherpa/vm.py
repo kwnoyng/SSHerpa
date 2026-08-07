@@ -201,7 +201,9 @@ def download_step() -> Step:
         label="fetch base image",
         command=(
             f"sudo mkdir -p {IMAGES_DIR} && "
-            f"test -f {BASE_IMAGE} || "
+            # 존재 확인도 sudo 로 — 못 읽은 것을 '없다' 로 읽으면
+            # 실행마다 600MB 를 다시 받는다.
+            f"sudo test -f {BASE_IMAGE} || "
             f"(sudo curl -fsSL -o {BASE_IMAGE}.tmp {BASE_IMAGE_URL} && "
             f"sudo qemu-img info {BASE_IMAGE}.tmp >/dev/null && "
             f"sudo mv {BASE_IMAGE}.tmp {BASE_IMAGE})"
@@ -674,7 +676,9 @@ def forwarding_installed(target: Target) -> bool:
     down 이 그것들을 지나쳐, 부팅마다 없는 주소로 6443 을 넘기는 규칙이
     되살아난다.
     """
-    result = run(target, f"test -f {FORWARD_UNIT_PATH} || test -f {FORWARD_SCRIPT}")
+    result = run(
+        target, f"sudo test -f {FORWARD_UNIT_PATH} || sudo test -f {FORWARD_SCRIPT}"
+    )
     return result.rc == 0
 
 
