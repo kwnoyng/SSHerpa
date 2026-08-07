@@ -4,6 +4,8 @@
 타임아웃) 실제 ssh 가 뱉는 문구를 그대로 넣어 검증한다.
 """
 
+import subprocess
+
 from ssherpa import ssh
 from ssherpa.ssh import Target
 
@@ -13,6 +15,64 @@ TARGET_WITH_KEY = Target(name="lab-01", host="h", user="admin", key="/tmp/k")
 
 def classify(stderr, target=TARGET):
     return ssh._classify(stderr, target)
+
+
+class TestResolveHostname:
+    """~/.ssh/config 의 별칭은 ssh 만 푼다. 답을 아는 쪽에 묻는다."""
+
+    ALIAS = Target(name="lab-01", host="lab", user="admin")
+
+    def fake_ssh(self, monkeypatch, stdout, returncode=0):
+        seen = {}
+
+        def fake_run(argv, **kwargs):  # noqa: ARG001
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, returncode, stdout, "")
+
+        monkeypatch.setattr(ssh.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh.subprocess, "run", fake_run)
+        return seen
+
+    def test_an_alias_resolves_to_its_hostname(self, monkeypatch):
+        self.fake_ssh(monkeypatch, "user admin\nhostname 10.0.0.10\nport 22\n")
+        assert ssh.resolve_hostname(self.ALIAS) == "10.0.0.10"
+
+    def test_it_asks_without_connecting(self, monkeypatch):
+        # -G 는 설정만 찍는다. 여기서 접속하면 조회가 느려지고 실패할 수 있다.
+        seen = self.fake_ssh(monkeypatch, "hostname 10.0.0.10\n")
+        ssh.resolve_hostname(self.ALIAS)
+        assert seen["argv"][:2] == ["ssh", "-G"]
+        assert "admin@lab" in seen["argv"]
+
+    def test_a_plain_address_comes_back_unchanged(self, monkeypatch):
+        self.fake_ssh(monkeypatch, "hostname 192.168.0.51\n")
+        assert ssh.resolve_hostname(TARGET) == "192.168.0.51"
+
+    def test_the_port_is_passed_so_config_matches_on_it(self, monkeypatch):
+        seen = self.fake_ssh(monkeypatch, "hostname 192.168.0.51\n")
+        ssh.resolve_hostname(TARGET)
+        assert "-p" in seen["argv"] and "22" in seen["argv"]
+
+    def test_a_failing_ssh_leaves_the_address_alone(self, monkeypatch):
+        self.fake_ssh(monkeypatch, "", returncode=255)
+        assert ssh.resolve_hostname(self.ALIAS) == "lab"
+
+    def test_output_without_a_hostname_line_leaves_it_alone(self, monkeypatch):
+        self.fake_ssh(monkeypatch, "user admin\nport 22\n")
+        assert ssh.resolve_hostname(self.ALIAS) == "lab"
+
+    def test_no_ssh_client_leaves_it_alone(self, monkeypatch):
+        monkeypatch.setattr(ssh.shutil, "which", lambda _n: None)
+        assert ssh.resolve_hostname(self.ALIAS) == "lab"
+
+    def test_a_crashing_ssh_leaves_it_alone(self, monkeypatch):
+        monkeypatch.setattr(ssh.shutil, "which", lambda _n: "/usr/bin/ssh")
+
+        def boom(*_a, **_k):
+            raise OSError("no exec")
+
+        monkeypatch.setattr(ssh.subprocess, "run", boom)
+        assert ssh.resolve_hostname(self.ALIAS) == "lab"
 
 
 class TestClassify:

@@ -18,6 +18,7 @@ from . import __version__, cluster, facts, probe, support, virt
 from . import distro as distro_mod
 from . import doctor as doctor_mod
 from . import kubeconfig as kubeconf
+from . import ssh as ssh_mod
 from . import vm as vm_mod
 from .cluster import ClusterError
 from .inventory import (
@@ -590,6 +591,24 @@ def _load_target(name: str) -> Target:
         return get_target(name)
 
 
+def _api_address(target: Target) -> str:
+    """kubectl 이 접속할 주소. 인증서 SAN 과 kubeconfig 에 그대로 들어간다.
+
+    타겟 주소가 ~/.ssh/config 의 별칭일 수 있다 — SSHerpa 는 그걸 허용하고,
+    ssh 는 알아서 푼다. 하지만 kubectl 은 그 파일을 읽지 않으므로, 별칭이
+    그대로 들어가면 '설치는 성공했는데 kubectl 은 전부 실패' 가 된다.
+    ssh 에게 물어 실제 이름으로 바꾸고, 바뀌었으면 그 사실을 말한다.
+    """
+    resolved = ssh_mod.resolve_hostname(target)
+    if resolved != target.host:
+        _say()
+        _say(
+            f"[dim]{target.host} resolves to {resolved} (~/.ssh/config) — "
+            "using that for kubectl.[/dim]"
+        )
+    return resolved
+
+
 def _kubectl_with_config(path) -> str:
     """kubeconfig 를 환경변수로 얹어 kubectl 을 부르는 한 줄.
 
@@ -744,6 +763,9 @@ def _up_vm(
         )
     chosen = _resolve_distro("k3s")
 
+    # 만들기 전에 정해둔다. 인증서에 한 번 박히면 바꾸는 데 재발급이 든다.
+    api_address = _api_address(target)
+
     # 이미 몇 대가 있는지는 호스트에게 묻는다. 저장해두지 않는 이유는
     # 늘 같다 — 파일과 현실이 어긋날 수 있으니까.
     with _surface_errors():
@@ -824,7 +846,7 @@ def _up_vm(
         # 인증서와 kubeconfig 에는 밖에서 닿는 주소(호스트)를 넣는다 —
         # VM 의 NAT 주소는 내 PC 의 kubectl 이 갈 수 없는 주소다.
         result = cluster.up(
-            server, chosen, reporter, api_address=target.host, agents=agents
+            server, chosen, reporter, api_address=api_address, agents=agents
         )
 
     _print_up_result(result, chosen.name, target, via_vm=True)
@@ -934,7 +956,9 @@ def up(
     console.print()
 
     with _surface_errors():
-        result = cluster.up(node, chosen, StepReporter(console))
+        result = cluster.up(
+            node, chosen, StepReporter(console), api_address=_api_address(target)
+        )
 
     _print_up_result(result, chosen.name, target)
 

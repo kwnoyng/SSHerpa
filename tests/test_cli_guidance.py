@@ -50,6 +50,28 @@ class TestKubectlLine:
         assert "KUBECONFIG=" in capsys.readouterr().out
 
 
+class TestApiAddress:
+    """ssh 는 푸는데 kubectl 은 못 푸는 이름이 있다."""
+
+    def test_a_plain_address_is_used_as_is(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli.ssh_mod, "resolve_hostname", lambda t: t.host)
+        assert cli._api_address(TARGET) == "192.0.2.10"
+        assert capsys.readouterr().out.strip() == ""  # 말할 것이 없다
+
+    def test_an_alias_becomes_the_address_ssh_would_use(self, monkeypatch):
+        alias = Target(name="lab-01", host="lab", user="admin")
+        monkeypatch.setattr(cli.ssh_mod, "resolve_hostname", lambda _t: "10.0.0.10")
+        assert cli._api_address(alias) == "10.0.0.10"
+
+    def test_the_substitution_is_not_silent(self, monkeypatch, capsys):
+        # 사용자가 적은 값과 인증서에 박히는 값이 다르면 그건 말해야 한다
+        alias = Target(name="lab-01", host="lab", user="admin")
+        monkeypatch.setattr(cli.ssh_mod, "resolve_hostname", lambda _t: "10.0.0.10")
+        cli._api_address(alias)
+        out = capsys.readouterr().out
+        assert "lab" in out and "10.0.0.10" in out and "ssh/config" in out
+
+
 class TestForwardingExposure:
     """열린 것을 알려주는 안내가 없었다 — 막힌 것만 알려주고 있었다."""
 
