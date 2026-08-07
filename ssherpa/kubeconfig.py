@@ -196,8 +196,10 @@ def remove(target_name: str, path: Optional[Path] = None) -> bool:
         changed = True
 
     if changed:
-        path.write_text(
-            yaml.safe_dump(data, sort_keys=False, default_flow_style=False),
-            encoding="utf-8",
+        # merge 와 같은 방식으로 쓴다. 기존 파일의 모드는 어차피 보존되지만,
+        # 자격증명을 담은 파일을 쓰는 방법이 이 파일 안에서 둘로 갈리면
+        # 한쪽만 고쳐지는 날이 온다.
+        write_private(
+            path, yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
         )
     return changed
