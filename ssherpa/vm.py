@@ -18,6 +18,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from xml.etree import ElementTree
 
 # API_PORT 는 cluster 와 같은 값을 공유해야 인증서(tls-san)·kubeconfig·
 # 포워딩이 한 포트를 가리킨다.
@@ -613,15 +614,107 @@ def reserve_ip_step(name: str, mac: str, ip: str) -> Step:
     )
 
 
-def release_ip_step(mac: str) -> Step:
-    """VM 이 사라지면 그 예약도 걷는다. 남겨두면 없는 MAC 이 주소를 붙든다."""
+def release_ip_step(mac: str = "", name: str = "") -> Step:
+    """VM 이 사라지면 그 예약도 걷는다. 남겨두면 없는 MAC 이 주소를 붙든다.
+
+    아는 식별자 전부로 지운다. reserve_ip_step 이 셋으로 지우는 이유와
+    같다 — 옛 예약이 어느 쪽으로 남아 있을지 알 수 없다. 손으로 지운 VM
+    자리에는 이름만 같고 MAC 은 다른 예약이 남고(실측), libvirt 는 MAC
+    없이 이름만 있는 예약도 받는다. 걷는 쪽이 MAC 하나만 보면 그런 항목이
+    남는데, 아래 `|| true` 가 실패를 삼켜서 '걷었다' 고 보고하게 된다.
+
+    IP 로는 지우지 않는다. 여기서는 그 주소를 쥔 남의 항목까지 지울 수
+    있고, reserve 와 달리 자리를 비워야 할 이유도 없다.
+    """
+    delete = (
+        "sudo virsh net-update default delete ip-dhcp-host "
+        "\"<host {}/>\" --live --config >/dev/null 2>&1 || true"
+    )
+    matches = [f"{attr}='{value}'" for attr, value in (("mac", mac), ("name", name)) if value]
+    if not matches:
+        raise VmError(
+            "cannot release a reservation without a MAC or a name",
+            ["Nothing identifies which entry to remove."],
+        )
     return Step(
         label="release vm address",
-        command=(
-            "sudo virsh net-update default delete ip-dhcp-host "
-            f"\"<host mac='{mac}'/>\" --live --config >/dev/null 2>&1 || true"
-        ),
+        command="\n".join(delete.format(match) for match in matches),
     )
+
+
+@dataclass
+class Reservation:
+    """default 네트워크에 걸린 주소 예약 하나."""
+
+    name: str
+    mac: str
+    ip: str
+
+
+def parse_reservations(xml_text: str) -> list[Reservation]:
+    """net-dumpxml 출력에서 우리 예약만 골라낸다.
+
+    정규식이 아니라 XML 파서로 읽는다 — 속성 순서는 libvirt 가 정하고,
+    우리가 넣은 순서대로 다시 나온다는 보장이 없다.
+    """
+    try:
+        root = ElementTree.fromstring(xml_text)
+    except ElementTree.ParseError:
+        return []
+
+    found = []
+    for host in root.findall("./ip/dhcp/host"):
+        name = host.get("name") or ""
+        # 접두사가 붙은 것만 우리 것이다 (VM 과 같은 소유 규칙).
+        if name.startswith(VM_PREFIX):
+            found.append(
+                Reservation(name=name, mac=host.get("mac") or "", ip=host.get("ip") or "")
+            )
+    return found
+
+
+def list_reservations(target: Target) -> list[Reservation]:
+    """호스트에 남아 있는 SSHerpa 주소 예약.
+
+    읽지 못하면 빈 목록이다 — 네트워크가 없으면 예약도 없다. list_vms 와
+    달리 실패를 오류로 올리지 않는 이유는, 이 정보를 쓰는 곳이 '치울 것이
+    더 있나' 뿐이라서다. 여기서 멈추면 진짜 할 일(VM 제거)까지 막힌다.
+    """
+    result = run(target, "sudo virsh net-dumpxml default", timeout=30)
+    if result.rc != 0:
+        return []
+    return parse_reservations(result.stdout)
+
+
+def stale_reservations(target: Target, live: list[str]) -> list[Reservation]:
+    """살아 있는 VM 이 없는 예약.
+
+    VM 을 `ssherpa down` 이 아니라 손으로(virsh) 지우면 예약만 남는다.
+    포워딩 장치가 남던 것과 같은 모양의 누수인데, 그쪽은 down 이 걷고
+    이쪽은 걷지 않아서 주소를 붙든 채 쌓였다 (실측: node-3/4/5).
+
+    live 는 지금 있는 VM 이름이다. 여기서 다시 묻지 않고 받는 이유는 두
+    가지다 — 호출부가 이미 알고 있어서 왕복이 하나 줄고, 무엇을 고아로
+    볼지 정하는 규칙이 한 곳에만 남는다.
+    """
+    known = set(live)
+    return [r for r in list_reservations(target) if r.name not in known]
+
+
+def release_reservations(
+    target: Target, reservations: list[Reservation], reporter=None
+) -> None:
+    """고아가 된 예약을 걷는다."""
+    if not reservations:
+        return
+
+    count = len(reservations)
+    label = f"release {count} stale address reservation{'s' if count > 1 else ''}"
+    with (reporter or _NullReporter()).step(label):
+        for reservation in reservations:
+            _run_step(
+                target, release_ip_step(reservation.mac, reservation.name)
+            )
 
 
 def unexpose_api_step() -> Step:
@@ -836,10 +929,11 @@ def destroy(target: Target, name: str, reporter=None) -> bool:
             ),
         )
 
-    if mac:
-        release = release_ip_step(mac)
-        with reporter.step(release.label):
-            _run_step(target, release)
+    # 이름도 함께 넘긴다. MAC 을 못 읽어도 예약은 걷어야 하고, 옛 예약이
+    # 이름만 같고 MAC 은 다른 채로 남아 있을 수도 있다 (실측).
+    release = release_ip_step(mac, name)
+    with reporter.step(release.label):
+        _run_step(target, release)
 
     # 제거 스크립트의 종료 코드를 믿지 않는다 — 실제로 사라졌는지 본다.
     with reporter.step("verify removal"):

@@ -29,6 +29,7 @@ from .inventory import (
     inventory_path,
     list_targets,
     remove_target,
+    update_target,
 )
 from .ssh import SSHError, Target, looks_like_option, run
 from .virt import VirtError
@@ -244,6 +245,64 @@ def target_add(
             (0, 0, 0, 2),
         )
     )
+    console.print(Padding(f"[dim]{inventory_path()}[/dim]", (0, 0, 0, 4)))
+    console.print()
+    console.print(Padding(f"[dim]Next:  ssherpa check {target.name}[/dim]", (0, 0, 0, 2)))
+    console.print()
+
+
+@target_app.command("update")
+def target_update(
+    name: str = typer.Argument(..., help="Registered target name"),
+    host: Optional[str] = typer.Option(
+        None, "--host", help="New IP, hostname, or ~/.ssh/config alias"
+    ),
+    user: Optional[str] = typer.Option(None, "--user", help="New SSH username"),
+    key: Optional[str] = typer.Option(None, "--key", help="New path to SSH private key"),
+    port: Optional[int] = typer.Option(None, "--port", help="New SSH port"),
+    unset: Optional[list[str]] = typer.Option(
+        None, "--unset", help="Clear a setting (user, port, key). Repeatable."
+    ),
+) -> None:
+    """Change a registered target's connection details. Does not connect.
+
+    Only what you pass is changed; everything else is left as it is. A
+    cloud host that gets a new address on every restart needs one flag,
+    not a remove and a re-add that would also drop the key and port.
+
+    Clearing is a separate flag on purpose: --unset port. Overloading a
+    value to also mean "erase this" is how things get erased by accident.
+    """
+    with _surface_errors():
+        target, changes = update_target(
+            name, host=host, user=user, port=port, key=key, unset=unset
+        )
+
+    console.print()
+    if not changes:
+        # 아무것도 안 바뀐 것을 '✓ 변경됨' 이라고 하면 거짓말이 된다.
+        console.print(
+            Padding(
+                f"[dim]{target.name} already had those values — nothing changed.[/dim]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
+        return
+
+    console.print(
+        Padding(
+            f"[green]✓[/green] [bold]{target.name}[/bold] updated  —  "
+            f"{target.endpoint()}",
+            (0, 0, 0, 2),
+        )
+    )
+    for change in changes:
+        before = "(unset)" if change.before is None else change.before
+        after = "(unset)" if change.after is None else change.after
+        console.print(
+            Padding(f"[dim]{change.field}:  {before}  →  {after}[/dim]", (0, 0, 0, 4))
+        )
     console.print(Padding(f"[dim]{inventory_path()}[/dim]", (0, 0, 0, 4)))
     console.print()
     console.print(Padding(f"[dim]Next:  ssherpa check {target.name}[/dim]", (0, 0, 0, 2)))
@@ -1116,30 +1175,69 @@ def down(
         # 남는다. 그걸 안 걷으면 부팅마다 없는 주소로 6443 을 넘기는
         # 규칙이 되살아나, 그 포트가 영영 막힌 호스트가 된다.
         forwarding = vm_mod.forwarding_installed(target)
+        # 주소 예약도 같은 이유로 남는다. 포워딩만 걷고 이쪽을 두면
+        # 없는 VM 이 주소를 붙든 채 쌓인다 (실측: node-3/4/5).
+        stale = vm_mod.stale_reservations(target, vms)
 
-    if not installed and not vms and not forwarding:
+    if not installed and not vms and not forwarding and not stale:
         console.print()
         console.print(Padding("[dim]Nothing is installed on this host.[/dim]", (0, 0, 0, 2)))
         console.print()
         return
 
-    # 클러스터를 통째로 없애는 동작이라 되돌릴 수 없다.
-    removing = installed + vms or ["the leftover API forwarding"]
+    # 무엇을 지우는지 그대로 적는다. 남은 자국만 걷는 자리에서 "클러스터를
+    # 파괴한다" 고 하면 없는 일을 경고하는 것이고, 그런 경고는 다음부터
+    # 읽히지 않는다 — 진짜로 클러스터가 걸린 순간에도.
+    # 포워딩은 VM 이 있으면 잔재가 아니라 그 클러스터로 가는 길이므로 따로
+    # 세지 않는다. 예약은 이미 '고아인 것' 만 골라낸 목록이라 언제나 따로 센다.
+    leftovers = []
+    if forwarding and not vms:
+        leftovers.append("the leftover API forwarding")
+    if stale:
+        leftovers.append(
+            f"{len(stale)} stale address reservation{'s' if len(stale) > 1 else ''}"
+        )
+
+    destroys_cluster = bool(installed or vms)
+    removing = installed + vms if destroys_cluster else leftovers
+
     console.print()
     console.print(
         Padding(
-            f"This removes [bold]{', '.join(removing)}[/bold] from [bold]{name}[/bold] "
-            "and destroys the cluster.",
+            f"This removes [bold]{', '.join(removing)}[/bold] from [bold]{name}[/bold]"
+            + (" and destroys the cluster." if destroys_cluster else "."),
             (0, 0, 0, 2),
         )
     )
-    console.print(Padding("[dim]Workloads and cluster state are lost.[/dim]", (0, 0, 0, 2)))
+    if destroys_cluster:
+        console.print(
+            Padding("[dim]Workloads and cluster state are lost.[/dim]", (0, 0, 0, 2))
+        )
+        # 클러스터 말고 더 걷는 것이 있으면 그것도 미리 말한다. 진행 표시에서
+        # 처음 보게 하면, 예고하지 않은 일을 한 것이 된다.
+        if leftovers:
+            console.print(
+                Padding(
+                    f"[dim]Also sweeping: {', '.join(leftovers)}.[/dim]", (0, 0, 0, 2)
+                )
+            )
+    else:
+        console.print(
+            Padding(
+                "[dim]No cluster is running here — these are leftovers.[/dim]",
+                (0, 0, 0, 2),
+            )
+        )
     console.print()
 
     # 물어볼 자리가 없다고 해서 승낙은 아니다. up 은 되돌릴 수 있으니 조용히
     # 진행해도 되지만, 여기서 잘못 진행하면 클러스터가 돌아오지 않는다 —
     # 파괴는 명시적으로 요청받았을 때만 한다.
-    if not assume_yes and not _interactive():
+    #
+    # 다만 되돌릴 것이 없는 자리까지 막지는 않는다. 없는 VM 을 가리키는
+    # 규칙과 예약을 걷는 데에는 잃을 것이 없고, 여기서 --yes 를 요구하면
+    # 스크립트로 뒷정리를 할 수 없다.
+    if destroys_cluster and not assume_yes and not _interactive():
         _fail(
             "Refusing to destroy a cluster without confirmation",
             [
@@ -1175,6 +1273,12 @@ def down(
                 path.unlink()
             with contextlib.suppress(kubeconf.KubeconfigError):
                 kubeconf.remove(entry)
+
+    # VM 을 지운 뒤에도 남는 예약이 있다 — 손으로 지워진 옛 노드의 것이다.
+    # destroy 는 자기가 지우는 VM 의 예약만 걷으므로, 그 밖은 여기서 쓴다.
+    if stale:
+        with _surface_errors():
+            vm_mod.release_reservations(target, stale, reporter)
 
     for distro_name in installed:
         chosen = _resolve_distro(distro_name)

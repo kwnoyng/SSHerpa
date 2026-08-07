@@ -119,10 +119,11 @@ class TestUnattendedDestruction:
         from ssherpa import cli
         from ssherpa.ssh import Target
 
-        target = Target(name="lab-01", host="10.0.0.1")
+        target = Target(name="lab-01", host="192.0.2.10")
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(cli, "_installed_on", lambda _n: installed)
         monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: vms)
+        monkeypatch.setattr(cli.vm_mod, "list_reservations", lambda _t: [])
         monkeypatch.setattr(cli.vm_mod, "forwarding_installed", lambda _t: bool(vms))
         monkeypatch.setattr(cli, "_interactive", lambda: False)
 
@@ -204,7 +205,7 @@ class TestStatusSurvivesALostConnection:
         from ssherpa.cluster import DistroStatus, HostStatus
         from ssherpa.ssh import Target
 
-        target = Target(name="lab-01", host="10.0.0.1")
+        target = Target(name="lab-01", host="192.0.2.10")
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(
             cli.cluster,
@@ -361,7 +362,7 @@ class TestNodesFlag:
         from ssherpa import cli
         from ssherpa.ssh import Target
 
-        target = Target(name="lab-01", host="10.0.0.1")
+        target = Target(name="lab-01", host="192.0.2.10")
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         # 이 지점보다 뒤로는 가지 않아야 한다 — 접속이 일어나면 실패다
         monkeypatch.setattr(
@@ -403,7 +404,7 @@ class TestNodeCapacity:
         from ssherpa import cli, virt
         from ssherpa.ssh import Target
 
-        target = Target(name="lab-01", host="10.0.0.1")
+        target = Target(name="lab-01", host="192.0.2.10")
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
         monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: [])
@@ -462,7 +463,7 @@ class TestExistingClusterSize:
         from ssherpa import cli, virt
         from ssherpa.ssh import Target
 
-        target = Target(name="lab-01", host="10.0.0.1")
+        target = Target(name="lab-01", host="192.0.2.10")
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
         monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: existing)
@@ -538,10 +539,11 @@ class TestLocalTracesAreRemoved:
         from ssherpa.ssh import Target
 
         vms = ["ssherpa-node-1", "ssherpa-node-2"]
-        target = Target(name="lab-01", host="10.0.0.1")
+        target = Target(name="lab-01", host="192.0.2.10")
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
         monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: vms)
+        monkeypatch.setattr(cli.vm_mod, "list_reservations", lambda _t: [])
         monkeypatch.setattr(cli.vm_mod, "forwarding_installed", lambda _t: True)
         monkeypatch.setattr(cli.vm_mod, "destroy", lambda *_a, **_k: True)
         monkeypatch.setattr(cli.vm_mod, "unexpose_api", lambda *_a, **_k: None)
@@ -571,7 +573,7 @@ class TestStatusSaysWhenItCouldNotLook:
         from ssherpa.cluster import DistroStatus, HostStatus
         from ssherpa.ssh import Target
 
-        target = Target(name="lab-01", host="10.0.0.1")
+        target = Target(name="lab-01", host="192.0.2.10")
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(
             cli.cluster,
@@ -687,10 +689,11 @@ class TestBrokenPromptIsNotConsent:
         from ssherpa import cli
         from ssherpa.ssh import Target
 
-        target = Target(name="lab-01", host="10.0.0.1")
+        target = Target(name="lab-01", host="192.0.2.10")
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(cli, "_installed_on", lambda _n: ["k3s"])
         monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: [])
+        monkeypatch.setattr(cli.vm_mod, "list_reservations", lambda _t: [])
         monkeypatch.setattr(cli.vm_mod, "forwarding_installed", lambda _t: False)
         monkeypatch.setattr(cli, "_interactive", lambda: True)
         monkeypatch.setattr(
@@ -714,10 +717,11 @@ class TestLeftoverForwardingIsRemovable:
         from ssherpa import cli
         from ssherpa.ssh import Target
 
-        target = Target(name="lab-01", host="10.0.0.1")
+        target = Target(name="lab-01", host="192.0.2.10")
         monkeypatch.setattr(cli, "_load_target", lambda _n: target)
         monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
         monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: [])
+        monkeypatch.setattr(cli.vm_mod, "list_reservations", lambda _t: [])
         monkeypatch.setattr(cli.vm_mod, "forwarding_installed", lambda _t: forwarding)
         closed = []
         monkeypatch.setattr(

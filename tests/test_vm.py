@@ -513,6 +513,40 @@ class TestAddressReservation:
         vm.destroy(TARGET, "ssherpa-node-1")
         assert fake.ran("delete ip-dhcp-host")
 
+    def test_destroy_releases_by_name_as_well_as_mac(self, host, monkeypatch):
+        # 손으로 지운 자리에는 이름만 같고 MAC 은 다른 예약이 남는다 (실측).
+        # MAC 만 보고 걷으면 그것이 그대로 남는다.
+        fake = host(state="running")
+        original = fake.run
+
+        def run_then_gone(target, command, timeout=30):
+            result = original(target, command, timeout)
+            if "undefine" in command:
+                fake.state = ""
+            return result
+
+        monkeypatch.setattr(vm, "run", run_then_gone)
+        vm.destroy(TARGET, "ssherpa-node-1")
+        assert fake.ran("name='ssherpa-node-1'")
+        assert fake.ran("mac='52:54:00:ab:cd:ef'")
+
+    def test_an_unreadable_mac_does_not_skip_the_release(self, host, monkeypatch):
+        # domiflist 를 못 읽어도 이름은 안다 — 예약은 걷어야 한다
+        fake = host(state="running")
+        original = fake.run
+
+        def no_mac(target, command, timeout=30):
+            if "domiflist" in command:
+                return CommandResult(0, "no table here", "")
+            result = original(target, command, timeout)
+            if "undefine" in command:
+                fake.state = ""
+            return result
+
+        monkeypatch.setattr(vm, "run", no_mac)
+        vm.destroy(TARGET, "ssherpa-node-1")
+        assert fake.ran("name='ssherpa-node-1'")
+
 
 class TestListVms:
     def test_filters_to_ssherpa_prefix(self, monkeypatch):
