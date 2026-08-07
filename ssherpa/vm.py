@@ -44,6 +44,13 @@ DOWNLOAD_TIMEOUT = 900  # 이미지 ~600MB — 회선에 따라 수 분
 IP_TIMEOUT = 180  # 첫 부팅 + DHCP 까지 기다리는 최대 시간(초)
 IP_POLL_INTERVAL = 3
 
+# 주소를 받은 뒤 cloud-init 이 계정을 만들 때까지 기다리는 최대 시간(초).
+SSH_TIMEOUT = 180
+SSH_POLL_INTERVAL = 3
+# 아직 안 뜬 sshd 는 바로 거절하지만, 부팅 중인 VM 은 SYN 을 삼키기도
+# 한다. 폴링이 기본 타임아웃에 걸려 멈추지 않도록 짧게 잡는다.
+SSH_PROBE_TIMEOUT = 15
+
 _MAC_RE = re.compile(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", re.IGNORECASE)
 
 
@@ -201,7 +208,9 @@ def download_step() -> Step:
         label="fetch base image",
         command=(
             f"sudo mkdir -p {IMAGES_DIR} && "
-            f"test -f {BASE_IMAGE} || "
+            # 존재 확인도 sudo 로 — 못 읽은 것을 '없다' 로 읽으면
+            # 실행마다 600MB 를 다시 받는다.
+            f"sudo test -f {BASE_IMAGE} || "
             f"(sudo curl -fsSL -o {BASE_IMAGE}.tmp {BASE_IMAGE_URL} && "
             f"sudo qemu-img info {BASE_IMAGE}.tmp >/dev/null && "
             f"sudo mv {BASE_IMAGE}.tmp {BASE_IMAGE})"
@@ -353,6 +362,42 @@ def wait_for_ip(
     )
 
 
+def wait_for_ssh(vm: Target, name: str, timeout: int = SSH_TIMEOUT) -> None:
+    """VM 이 명령을 받을 수 있을 때까지 기다린다.
+
+    주소를 받은 것과 접속을 받을 수 있는 것은 다른 사건이다. DHCP 임대는
+    cloud-init 의 network 단계에서 올라오는데, ssherpa 계정과 그 계정의
+    authorized_keys 는 그 다음 단계에서 만들어진다. 그 사이에 접속하면
+    키가 아직 없으니 거부당하고, ssh 는 그것을 인증 실패로 보고한다 —
+    사용자는 "기본 키들이 거부됐다" 는, 원인과 무관한 안내를 받는다.
+
+    임대 확인 뒤에 낀 일이 두 단계뿐이라(주소 예약, 포워딩) 창이 몇 초로
+    좁고, 그래서 대개는 그냥 지나간다. 대개 지나가는 경합이 제일 나쁘다.
+    """
+    deadline = time.monotonic() + timeout
+    detail: list[str] = []
+    while True:
+        # 인증까지 끝나야 성공하는, 아무것도 하지 않는 명령.
+        result = run(vm, "true", timeout=SSH_PROBE_TIMEOUT)
+        if result.rc == 0:
+            return
+        detail = (result.stderr or "").strip().splitlines()[-2:]
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(SSH_POLL_INTERVAL)
+
+    raise VmError(
+        f"{name} booted but never accepted a connection within {timeout}s",
+        detail
+        + [
+            "The VM has an address, so it is running. What did not finish is",
+            "cloud-init, which creates the account SSHerpa logs in as.",
+            "Watch it boot from the host console:",
+            f"    sudo virsh console {name}   (exit with Ctrl+])",
+        ],
+    )
+
+
 def create(
     target: Target, *, spec: Optional[VmSpec] = None, reporter=None
 ) -> VmInfo:
@@ -397,7 +442,15 @@ def create(
     with reporter.step(reserve.label):
         _run_step(target, reserve)
 
-    return VmInfo(name=spec.name, ip=ip, mac=mac, already_existed=already)
+    info = VmInfo(name=spec.name, ip=ip, mac=mac, already_existed=already)
+
+    # 여기서 기다려야 다음에 오는 것들(포워딩, 쿠버네티스 설치)이 준비된
+    # VM 을 본다. 이 함수가 'VM 을 쓸 수 있게 만든다' 고 말하는 이상,
+    # 쓸 수 있는 상태까지가 이 함수의 몫이다.
+    with reporter.step("wait for ssh"):
+        wait_for_ssh(vm_target(target, info), spec.name)
+
+    return info
 
 
 
@@ -674,7 +727,9 @@ def forwarding_installed(target: Target) -> bool:
     down 이 그것들을 지나쳐, 부팅마다 없는 주소로 6443 을 넘기는 규칙이
     되살아난다.
     """
-    result = run(target, f"test -f {FORWARD_UNIT_PATH} || test -f {FORWARD_SCRIPT}")
+    result = run(
+        target, f"sudo test -f {FORWARD_UNIT_PATH} || sudo test -f {FORWARD_SCRIPT}"
+    )
     return result.rc == 0
 
 

@@ -60,6 +60,44 @@ class Target:
         return f"{self.destination()}:{self.port}" if self.port else self.destination()
 
 
+def resolve_hostname(target: Target) -> str:
+    """ssh 가 이 타겟에 실제로 접속하는 호스트 이름.
+
+    ~/.ssh/config 의 별칭은 ssh 만 푼다. SSHerpa 는 별칭을 그대로 받는데
+    (그게 사용자의 설정을 존중하는 방식이다), 그 값이 인증서 SAN 과
+    kubeconfig 의 접속 주소로도 쓰인다. ssh 는 풀고 kubectl 은 못 푸는
+    이름이라, 클러스터는 멀쩡한데 kubectl 이 전부 실패하는 kubeconfig 가
+    만들어진다.
+
+    답을 아는 것은 ssh 자신이므로 ssh 에게 묻는다. `-G` 는 접속하지 않고
+    적용될 설정만 찍는다 — 네트워크를 타지 않는 로컬 조회다.
+
+    물어볼 수 없거나 대답이 없으면 원래 값을 그대로 돌려준다. 여기서
+    실패해도 전보다 나빠지지는 않는다.
+    """
+    if shutil.which("ssh") is None:
+        return target.host
+
+    argv = ["ssh", "-G"]
+    if target.port:
+        argv += ["-p", str(target.port)]
+    argv.append(target.destination())
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return target.host
+    if result.returncode != 0:
+        return target.host
+
+    for line in result.stdout.splitlines():
+        # `hostname <값>` — 별칭이 없으면 넘긴 값이 그대로 나온다.
+        if line.startswith("hostname "):
+            return line.split(None, 1)[1].strip() or target.host
+    return target.host
+
+
 def looks_like_option(host: str) -> bool:
     """ssh 가 목적지 대신 옵션으로 읽어버릴 주소인가.
 

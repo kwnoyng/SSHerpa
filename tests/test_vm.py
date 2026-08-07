@@ -214,7 +214,62 @@ def host(monkeypatch):
     return build
 
 
+class TestWaitForSsh:
+    """주소를 받은 것과 접속을 받을 수 있는 것은 다른 사건이다.
+
+    DHCP 임대는 cloud-init 의 network 단계에서 올라오고, ssherpa 계정과
+    그 키는 그 다음 단계에서 만들어진다. 그 사이에 접속하면 키가 아직
+    없어서 거부당하고, ssh 는 그걸 인증 실패로 보고한다.
+    """
+
+    def test_returns_as_soon_as_the_vm_answers(self, monkeypatch):
+        replies = [
+            CommandResult(255, "", "Permission denied (publickey)."),
+            CommandResult(255, "", "Permission denied (publickey)."),
+            CommandResult(0, "", ""),
+        ]
+        monkeypatch.setattr(vm, "run", lambda *a, **k: replies.pop(0))  # noqa: ARG005
+        monkeypatch.setattr(vm.time, "sleep", lambda _s: None)
+        vm.wait_for_ssh(TARGET, "ssherpa-node-1")
+        assert replies == []  # 세 번째에서 멈췄다
+
+    def test_the_probe_changes_nothing_on_the_vm(self, monkeypatch):
+        sent = []
+
+        def record(target, command, timeout=30):  # noqa: ARG001
+            sent.append(command)
+            return CommandResult(0, "", "")
+
+        monkeypatch.setattr(vm, "run", record)
+        vm.wait_for_ssh(TARGET, "ssherpa-node-1")
+        assert sent == ["true"]
+
+    def test_giving_up_blames_cloud_init_not_the_key(self, monkeypatch):
+        # 여기서 인증 실패라고 안내하면 사용자는 있지도 않은 키 문제를 쫓는다
+        monkeypatch.setattr(
+            vm,
+            "run",
+            lambda *a, **k: CommandResult(  # noqa: ARG005
+                255, "", "Permission denied (publickey)."
+            ),
+        )
+        monkeypatch.setattr(vm.time, "sleep", lambda _s: None)
+        with pytest.raises(vm.VmError) as excinfo:
+            vm.wait_for_ssh(TARGET, "ssherpa-node-1", timeout=0)
+        assert "never accepted a connection" in excinfo.value.message
+        assert any("cloud-init" in hint for hint in excinfo.value.hints)
+        # 원격이 한 말도 버리지 않는다
+        assert any("Permission denied" in hint for hint in excinfo.value.hints)
+
+
 class TestCreateFlow:
+    def test_the_vm_answers_before_create_returns(self, host):
+        # create 가 '쓸 수 있는 VM' 을 돌려준다고 말하는 이상, 마지막으로
+        # 확인할 것은 그 VM 이 명령을 받는다는 사실이다.
+        fake = host(state="")
+        vm.create(TARGET)
+        assert fake.commands[-1] == "true"
+
     def test_fresh_create_walks_every_step(self, host):
         fake = host(state="")
         info = vm.create(TARGET)

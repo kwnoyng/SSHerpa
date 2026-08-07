@@ -18,6 +18,7 @@ from . import __version__, cluster, facts, probe, support, virt
 from . import distro as distro_mod
 from . import doctor as doctor_mod
 from . import kubeconfig as kubeconf
+from . import ssh as ssh_mod
 from . import vm as vm_mod
 from .cluster import ClusterError
 from .inventory import (
@@ -132,10 +133,34 @@ def _resolve_target(
 
     check 와 doctor 가 같은 규칙을 쓴다 — 인자 해석이 두 벌로 갈라지면
     한쪽만 고쳐지는 일이 생긴다.
+
+    등록된 이름을 줬으면 접속 정보는 전부 인벤토리에서 온다. --host/--user
+    만 막고 --port/--key 는 조용히 버리면, 같은 함수 안에 규칙이 두 개가
+    된다 — 사용자는 `check lab-01 --key ~/.ssh/other` 가 그 키로 붙었다고
+    믿게 되고, 실제로는 인벤토리의 키로 붙는다.
     """
     if name:
-        if host or user:
-            _fail("A target name cannot be combined with --host/--user.", USAGE_HINTS)
+        conflicting = [
+            flag
+            for flag, value in (
+                ("--host", host),
+                ("--user", user),
+                ("--port", port),
+                ("--key", key),
+            )
+            if value is not None
+        ]
+        if conflicting:
+            _fail(
+                f"A target name cannot be combined with {'/'.join(conflicting)}.",
+                [
+                    "Connection details come from the registered target.",
+                    "",
+                    *USAGE_HINTS,
+                    "",
+                    f"Change what is registered:  ssherpa target add {name} ...",
+                ],
+            )
         with _surface_errors():
             return get_target(name)
 
@@ -566,7 +591,67 @@ def _load_target(name: str) -> Target:
         return get_target(name)
 
 
-def _print_up_result(result, distro_name: str, target: Target) -> None:
+def _api_address(target: Target) -> str:
+    """kubectl 이 접속할 주소. 인증서 SAN 과 kubeconfig 에 그대로 들어간다.
+
+    타겟 주소가 ~/.ssh/config 의 별칭일 수 있다 — SSHerpa 는 그걸 허용하고,
+    ssh 는 알아서 푼다. 하지만 kubectl 은 그 파일을 읽지 않으므로, 별칭이
+    그대로 들어가면 '설치는 성공했는데 kubectl 은 전부 실패' 가 된다.
+    ssh 에게 물어 실제 이름으로 바꾸고, 바뀌었으면 그 사실을 말한다.
+    """
+    resolved = ssh_mod.resolve_hostname(target)
+    if resolved != target.host:
+        _say()
+        _say(
+            f"[dim]{target.host} resolves to {resolved} (~/.ssh/config) — "
+            "using that for kubectl.[/dim]"
+        )
+    return resolved
+
+
+def _kubectl_with_config(path) -> str:
+    """kubeconfig 를 환경변수로 얹어 kubectl 을 부르는 한 줄.
+
+    이 명령을 붙여넣는 곳은 원격 호스트가 아니라 사용자의 터미널이다.
+    문법은 그쪽 셸이 정하므로, 원격 명령과 달리 여기서만 OS 를 본다.
+    """
+    if os.name == "nt":
+        return f'$env:KUBECONFIG="{path}"; kubectl'
+    return f"KUBECONFIG={path} kubectl"
+
+
+def _print_forwarding_exposure(target: Target) -> None:
+    """VM 모드가 열어둔 길이 무엇을 지나가는지 밝힌다.
+
+    호스트의 6443 을 VM 으로 넘기는 규칙은 FORWARD 체인 맨 앞에 들어간다.
+    libvirt 의 거부 규칙보다 앞서야 해서 그런데, 그 자리는 ufw/firewalld 의
+    규칙보다도 앞이다. 게다가 넘겨지는 패킷에는 INPUT 규칙이 적용되지
+    않는다 — 호스트가 6443 을 INPUT 에서 막고 있어도 VM 의 API 는 열린다.
+
+    막힌 것을 알려주는 안내는 이미 있는데, 정작 위험한 쪽은 열린 쪽이다.
+    사용자가 호스트 방화벽을 믿고 있다면 그 믿음이 여기서 틀린다.
+
+    과장하지는 않는다: 클라우드나 네트워크 방화벽은 호스트 바깥이라
+    그대로 유효하다. 우회되는 것은 호스트의 iptables 층뿐이다.
+    """
+    where = target.name or target.host
+    _say()
+    _say(
+        f"[yellow]Note: port {cluster.API_PORT} on the host now reaches the "
+        "VM's API server.[/yellow]"
+    )
+    for line in (
+        "The rule sits ahead of the host's own firewall (ufw, firewalld),",
+        "and forwarded traffic never passes INPUT, so blocking 6443 there",
+        "will not close this. Firewalls upstream of the host still apply.",
+        f"Close it with:  ssherpa down {where}",
+    ):
+        _say(f"[dim]{line}[/dim]", indent=4)
+
+
+def _print_up_result(
+    result, distro_name: str, target: Target, *, via_vm: bool = False
+) -> None:
     """up 의 결과 요약과 다음 할 일 안내.
 
     ~/.kube/config 병합 결과에 따라 kubectl 사용법이 셋으로 갈린다:
@@ -591,7 +676,7 @@ def _print_up_result(result, distro_name: str, target: Target) -> None:
     if result.merge_error:
         _say(f"[yellow]Could not update ~/.kube/config: {result.merge_error}[/yellow]")
         _say("Use the standalone file instead:", indent=4)
-        kubectl = f'$env:KUBECONFIG="{result.kubeconfig}"; kubectl'
+        kubectl = _kubectl_with_config(result.kubeconfig)
     elif result.context_is_current:
         _say(
             f"[dim]Added to ~/.kube/config as context "
@@ -610,6 +695,8 @@ def _print_up_result(result, distro_name: str, target: Target) -> None:
     if result.api_reachable:
         _say("Use it from any terminal:")
         _say(f"[dim]{kubectl} get nodes[/dim]", indent=4)
+        if via_vm:
+            _print_forwarding_exposure(target)
     else:
         # 포트가 막힌 것은 흔한 정상 상황이다. 실패로 처리하지 않고 방법을 안내한다.
         _say(f"[yellow]Port {cluster.API_PORT} is not reachable from here.[/yellow]")
@@ -650,8 +737,6 @@ def _up_vm(
     클러스터의 크기를 그대로 따른다. 1 로 단정하면 3노드가 도는 호스트에서
     '1노드 준비됨' 이라고 보고하게 된다 (실측).
     """
-    if nodes is not None and nodes < 1:
-        _fail("--nodes must be at least 1")
     # 호스트에 직접 설치된 클러스터와는 공존할 수 없다. kubectl 이 쓸 6443 을
     # 호스트 모드는 자신이 듣고, vm 모드는 VM 으로 넘겨야 하기 때문이다.
     node_host = cluster.nodes_for_host_mode(target)[0]
@@ -677,6 +762,9 @@ def _up_vm(
             ],
         )
     chosen = _resolve_distro("k3s")
+
+    # 만들기 전에 정해둔다. 인증서에 한 번 박히면 바꾸는 데 재발급이 든다.
+    api_address = _api_address(target)
 
     # 이미 몇 대가 있는지는 호스트에게 묻는다. 저장해두지 않는 이유는
     # 늘 같다 — 파일과 현실이 어긋날 수 있으니까.
@@ -758,10 +846,10 @@ def _up_vm(
         # 인증서와 kubeconfig 에는 밖에서 닿는 주소(호스트)를 넣는다 —
         # VM 의 NAT 주소는 내 PC 의 kubectl 이 갈 수 없는 주소다.
         result = cluster.up(
-            server, chosen, reporter, api_address=target.host, agents=agents
+            server, chosen, reporter, api_address=api_address, agents=agents
         )
 
-    _print_up_result(result, chosen.name, target)
+    _print_up_result(result, chosen.name, target, via_vm=True)
 
 
 @app.command("up")
@@ -793,6 +881,15 @@ def up(
     spreads it over that many VMs.
     """
     target = _load_target(name)
+
+    # 값이 말이 되는지를 모드보다 먼저 본다. 순서가 반대면 `--nodes 0` 이
+    # 호스트 모드에서 "--vm 을 붙이라" 는 안내를 받는데, 붙여도 거절이다 —
+    # 고칠 수 없는 명령을 시키는 안내가 된다.
+    if nodes is not None and nodes < 1:
+        _fail(
+            f"--nodes must be at least 1 (got {nodes})",
+            ["A cluster needs a node to run on."],
+        )
 
     if vm_mode:
         _up_vm(name, target, distro, nodes)
@@ -859,7 +956,9 @@ def up(
     console.print()
 
     with _surface_errors():
-        result = cluster.up(node, chosen, StepReporter(console))
+        result = cluster.up(
+            node, chosen, StepReporter(console), api_address=_api_address(target)
+        )
 
     _print_up_result(result, chosen.name, target)
 

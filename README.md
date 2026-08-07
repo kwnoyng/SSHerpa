@@ -310,6 +310,13 @@ kubectl --server https://127.0.0.1:6443 get nodes
 Opening 6443 to the internet would expose the cluster API; if you do open it,
 restrict it to your own address.
 
+In VM mode, note which firewall governs that port. The rule forwarding
+6443 into the VM has to sit ahead of libvirt's own reject rule, which puts
+it ahead of `ufw` and `firewalld` too — and forwarded packets never traverse
+`INPUT`, so a rule blocking 6443 there does not close this path. Firewalls
+upstream of the host — cloud or network — are unaffected and still apply.
+`ssherpa down` removes the forwarding rule along with the VMs.
+
 ### 4. Inspect and tear down
 
 ```bash
