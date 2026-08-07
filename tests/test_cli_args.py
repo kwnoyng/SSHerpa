@@ -67,6 +67,13 @@ class TestNameAndConnectionFlags:
         target = resolve(host="10.0.0.20", user="root", port=2222, key="~/k")
         assert (target.host, target.port, target.key) == ("10.0.0.20", 2222, "~/k")
 
+    def test_a_one_off_ipv6_host_is_allowed(self):
+        # 등록은 IPv6 를 거절하지만(반쪽 지원 방지), 일회성 진단은 받는다 —
+        # check/doctor 는 IPv6 가 부러지는 네 자리 중 어느 것도 안 건드린다.
+        # 이 비대칭은 의도이며, 여기서 바뀌면 그 결정을 다시 한 것이다.
+        target = resolve(host="2001:db8::1", user="admin")
+        assert target.host == "2001:db8::1"
+
 
 class TestNodeCount:
     def test_zero_is_refused_before_the_mode_is_considered(self, capsys):

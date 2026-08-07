@@ -20,6 +20,13 @@ from .ssh import Target, looks_like_option
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
+# 주소로 인정하는 문자들. IP·호스트명·~/.ssh/config 별칭은 전부 이 안에
+# 들어온다. 이보다 넓히면 안 되는 이유가 있다: 주소는 원격 셸 명령
+# 안으로 들어간다(tls-san 설정 쓰기 등) — 따옴표가 섞인 주소는 거기서
+# 셸 문법이 된다. 자기 인벤토리를 자기가 망가뜨리는 길이지만, 검사할
+# 자리가 있는데 열어둘 이유가 없다.
+HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
 # 주소가 '-' 로 시작하면 ssh 가 그것을 옵션으로 읽는다. 인벤토리는 한 번
 # 적어두면 이후 모든 명령이 말없이 쓰는 값이라, 들어오는 자리에서 막는다.
 HOST_OPTION_HINT = [
@@ -54,6 +61,17 @@ def _checked_host(host: str) -> str:
     if looks_like_option(host):
         raise InventoryError(
             f"'{host}' is not a valid address.\n" + "\n".join(HOST_OPTION_HINT)
+        )
+    if not HOST_PATTERN.match(host):
+        # IPv6 도 여기서 거절된다(콜론). 의도다 — 콜론만 허용하면 등록은
+        # 되는데 kubeconfig URL 은 대괄호 없이 깨지고, -J 의 '주소:포트'
+        # 표기와 충돌하고, VM 포워딩은 iptables(v4) 전용이라 조용히
+        # 버려진다. 반쯤 되는 것보다 명확한 거절이 낫다.
+        raise InventoryError(
+            f"'{host}' is not a valid address.\n"
+            "An address is letters, digits, dots, dashes and underscores —\n"
+            "an IPv4 address, a hostname, or a Host alias from ~/.ssh/config.\n"
+            "IPv6 is not supported yet."
         )
     return host
 
@@ -155,9 +173,23 @@ def _port_of(name: str, port) -> Optional[int]:
     return number
 
 
-def list_targets() -> list[Target]:
+def list_targets() -> tuple[list[Target], list[tuple[str, str]]]:
+    """(성한 타겟들, 깨진 (이름, 사유) 목록).
+
+    한 항목이 깨졌다고 목록 전체를 거절하면, 그 항목을 고치려는 사용자가
+    자기 목록조차 못 본다 — 뭐가 있는지 보는 길이 list 인데. 깨진 항목은
+    숨기지 않고 사유와 함께 따로 돌려준다. 그 항목을 실제로 쓰는
+    get_target 은 지금처럼 거절한다.
+    """
     hosts = _load_raw()["all"]["hosts"]
-    return [_to_target(name, vars_ or {}) for name, vars_ in sorted(hosts.items())]
+    targets: list[Target] = []
+    broken: list[tuple[str, str]] = []
+    for name, vars_ in sorted(hosts.items()):
+        try:
+            targets.append(_to_target(name, vars_ or {}))
+        except InventoryError as exc:
+            broken.append((name, str(exc).splitlines()[0]))
+    return targets, broken
 
 
 def get_target(name: str) -> Target:

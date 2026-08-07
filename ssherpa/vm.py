@@ -431,6 +431,26 @@ def create(
         state = vm_state(target, spec.name)
         already = bool(state)
 
+        # 재사용 VM 은 만들어질 때의 키만 받는다. 그 키가 로컬에서
+        # 사라졌으면 이 VM 에는 이제 아무도 못 들어간다 — 새 키를 만드는
+        # 것은 답이 아니고(VM 은 옛 키만 안다), 그대로 진행하면
+        # wait_for_ssh 가 180초를 헛기다린 끝에 cloud-init 을 의심하는
+        # 엉뚱한 안내를 낸다. 지금 사실대로 말하는 것이 유일한 수리다.
+        if already:
+            private, _ = local_key_paths()
+            if not private.exists():
+                label = target.name or "<target>"
+                raise VmError(
+                    f"the key SSHerpa uses to enter its VMs is gone ({private})",
+                    [
+                        f"{spec.name} only accepts the key it was built with,",
+                        "so it cannot be entered any more — by SSHerpa or by hand.",
+                        "Rebuild from scratch:",
+                        f"    ssherpa down {label}",
+                        f"    ssherpa up {label} --vm",
+                    ],
+                )
+
     if not already:
         pubkey = ensure_local_key()
         for step in (download_step(), disk_step(spec), seed_step(spec, pubkey)):

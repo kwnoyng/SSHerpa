@@ -175,6 +175,11 @@ def _resolve_target(
         _fail("A target name or --host is required.", _usage_hints(verb))
     if looks_like_option(host):
         _fail(f"'{host}' is not a valid address.", HOST_OPTION_HINT)
+    # 일회성 --host 는 등록보다 관대하다 — IPv6 도 여기서는 통과한다.
+    # 의도다: check/doctor 는 IPv6 가 부러지는 자리(kubeconfig URL,
+    # -J 표기, v4 전용 포워딩, SAN 비교) 중 어느 것도 건드리지 않으므로
+    # 진단은 실제로 된다. 문은 등록에 걸려 있다 — up 까지 가는 건
+    # 등록된 타겟뿐이니까.
     return Target(name=None, host=host, user=user, port=port, key=key)
 
 
@@ -319,9 +324,9 @@ def target_update(
 def target_list() -> None:
     """List registered targets. Does not connect."""
     with _surface_errors():
-        targets = list_targets()
+        targets, broken = list_targets()
 
-    if not targets:
+    if not targets and not broken:
         console.print()
         console.print(Padding("[dim]No targets registered.[/dim]", (0, 0, 0, 2)))
         console.print()
@@ -334,24 +339,36 @@ def target_list() -> None:
         console.print()
         return
 
-    table = Table(box=None, pad_edge=False, padding=(0, 3, 0, 0))
-    table.add_column("NAME", style="bold")
-    table.add_column("HOST")
-    table.add_column("USER")
-    table.add_column("PORT", justify="right")
+    console.print()
+    if targets:
+        table = Table(box=None, pad_edge=False, padding=(0, 3, 0, 0))
+        table.add_column("NAME", style="bold")
+        table.add_column("HOST")
+        table.add_column("USER")
+        table.add_column("PORT", justify="right")
 
-    for target in targets:
-        # 비워둔 항목은 접속 시 ~/.ssh/config 가 정한다
-        table.add_row(
-            target.name,
-            target.host,
-            target.user or "[dim]—[/dim]",
-            str(target.port) if target.port else "[dim]—[/dim]",
+        for target in targets:
+            # 비워둔 항목은 접속 시 ~/.ssh/config 가 정한다
+            table.add_row(
+                target.name,
+                target.host,
+                target.user or "[dim]—[/dim]",
+                str(target.port) if target.port else "[dim]—[/dim]",
+            )
+        console.print(Padding(table, (0, 0, 0, 2)))
+        console.print()
+
+    # 깨진 항목도 이름은 보인다 — 숨기면 사용자는 자기가 뭘 고쳐야 하는지
+    # 목록에서조차 알 수 없다.
+    for name, reason in broken:
+        err_console.print(
+            Padding(f"[yellow]![/yellow] [bold]{name}[/bold]  {reason}", (0, 0, 0, 2))
         )
-
-    console.print()
-    console.print(Padding(table, (0, 0, 0, 2)))
-    console.print()
+    if broken:
+        err_console.print(
+            Padding(f"[dim]Fix them in {inventory_path()}[/dim]", (0, 0, 0, 2))
+        )
+        err_console.print()
 
 
 @target_app.command("remove")

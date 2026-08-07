@@ -105,17 +105,19 @@ class TestAnsibleFormat:
 
 class TestListAndRemove:
     def test_empty_inventory(self):
-        assert list_targets() == []
+        assert list_targets() == ([], [])
 
     def test_sorted_by_name(self):
         for name in ["zulu", "alpha", "mike"]:
             add_target(name, host="10.0.0.1", user="admin")
-        assert [t.name for t in list_targets()] == ["alpha", "mike", "zulu"]
+        targets, broken = list_targets()
+        assert [t.name for t in targets] == ["alpha", "mike", "zulu"]
+        assert broken == []
 
     def test_remove(self):
         add_target("lab-01", host="10.0.0.1", user="admin")
         remove_target("lab-01")
-        assert list_targets() == []
+        assert list_targets() == ([], [])
 
     def test_remove_missing_lists_known_targets(self):
         add_target("lab-01", host="10.0.0.1", user="admin")
@@ -274,7 +276,7 @@ class TestPortIsChecked:
     def test_a_refused_port_is_not_written(self):
         with pytest.raises(InventoryError):
             add_target("lab-01", host="10.0.0.1", port=0)
-        assert list_targets() == []
+        assert list_targets() == ([], [])
 
     def test_a_refused_update_leaves_the_old_port(self):
         add_target("lab-01", host="10.0.0.1", port=2222)
@@ -345,9 +347,86 @@ class TestEmptyValuesAreRefused:
             add_target("lab-01", host="-oProxyCommand=evil")
 
 
+class TestHostCharset:
+    """주소는 원격 셸 명령 안으로 들어간다(tls-san 설정 쓰기 등).
+
+    따옴표가 섞인 주소는 거기서 셸 문법이 된다 — 자기 인벤토리를 자기가
+    망가뜨리는 길이지만, 0.5.5 가 검사 자리(_checked_host)를 만들고도
+    이 문은 열어뒀었다.
+    """
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "1.2.3.4' ; touch /tmp/x ; '",  # 실측했던 그 모양
+            "host name",  # 공백
+            "host`id`",
+            "host$(id)",
+            'host"quote',
+            "host;semicolon",
+        ],
+    )
+    def test_shell_looking_addresses_are_refused(self, host):
+        with pytest.raises(InventoryError, match="not a valid address"):
+            add_target("lab-01", host=host)
+
+    def test_update_runs_the_same_check(self):
+        add_target("lab-01", host="10.0.0.1")
+        with pytest.raises(InventoryError, match="not a valid address"):
+            update_target("lab-01", host="x' ; id ; '")
+
+    @pytest.mark.parametrize(
+        "host", ["10.0.0.1", "lab", "host.example.com", "my-lab_2", "k8s-node.a-b.io"]
+    )
+    def test_real_addresses_still_pass(self, host):
+        add_target("t", host=host)
+        assert get_target("t").host == host
+
+    @pytest.mark.parametrize("host", ["2001:db8::1", "::1", "[2001:db8::1]"])
+    def test_ipv6_is_refused_and_says_so(self, host):
+        # 반쪽 지원이었다: 0.6.0 은 등록은 받았지만 kubeconfig URL 이
+        # 대괄호 없이 깨졌고, -J 표기와 충돌하고, VM 포워딩(iptables v4)
+        # 은 조용히 버렸다. 지원하게 되기 전까지는 명확히 거절하고,
+        # 거절 문구가 그 사실을 말한다.
+        with pytest.raises(InventoryError, match="IPv6 is not supported"):
+            add_target("v6", host=host)
+
+
+class TestBrokenEntriesDoNotSinkTheList:
+    """한 항목이 깨졌다고 목록 전체를 거절하면, 그 항목을 고치려는
+    사용자가 자기 목록조차 못 본다."""
+
+    def _write(self, temp_inventory):
+        temp_inventory.write_text(
+            "all:\n  hosts:\n"
+            "    good-1:\n      ansible_host: 10.0.0.1\n"
+            "    broken:\n      ansible_host: 10.0.0.2\n      ansible_port: 'abc'\n"
+            "    good-2:\n      ansible_host: 10.0.0.3\n"
+        )
+
+    def test_healthy_entries_survive(self, temp_inventory):
+        self._write(temp_inventory)
+        targets, broken = list_targets()
+        assert [t.name for t in targets] == ["good-1", "good-2"]
+
+    def test_the_broken_one_is_named_with_a_reason(self, temp_inventory):
+        self._write(temp_inventory)
+        _, broken = list_targets()
+        assert len(broken) == 1
+        name, reason = broken[0]
+        assert name == "broken"
+        assert "not a number" in reason
+
+    def test_using_the_broken_one_still_refuses(self, temp_inventory):
+        # 목록이 보여주는 것과 쓰는 것은 다르다 — 쓰려는 순간에는 거절
+        self._write(temp_inventory)
+        with pytest.raises(InventoryError, match="not a number"):
+            get_target("broken")
+
+
 class TestFileHandling:
     def test_missing_file_is_not_an_error(self):
-        assert list_targets() == []
+        assert list_targets() == ([], [])
 
     def test_corrupt_yaml_reports_path(self, temp_inventory):
         temp_inventory.write_text("all: [unclosed\n")
@@ -361,7 +440,7 @@ class TestFileHandling:
 
     def test_empty_hosts_block(self, temp_inventory):
         temp_inventory.write_text("all:\n  hosts:\n")
-        assert list_targets() == []
+        assert list_targets() == ([], [])
 
     def test_env_override_is_honored(self, temp_inventory):
         assert inventory_path() == temp_inventory
@@ -378,12 +457,13 @@ class TestFileHandling:
             get_target("lab-01")
 
     def test_the_bad_port_error_says_where_to_fix_it(self, temp_inventory):
+        # 그 항목을 실제로 쓰려는 순간(get_target)에는 여전히 거절이다
         temp_inventory.write_text(
             "all:\n  hosts:\n    lab-01:\n"
             "      ansible_host: 10.0.0.1\n      ansible_port: []\n"
         )
         with pytest.raises(InventoryError) as excinfo:
-            list_targets()
+            get_target("lab-01")
         assert str(temp_inventory) in str(excinfo.value)
 
     def test_a_port_written_as_a_string_still_works(self, temp_inventory):

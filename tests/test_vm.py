@@ -210,11 +210,19 @@ class FakeHost:
 
 
 @pytest.fixture
-def host(monkeypatch):
+def host(monkeypatch, tmp_path):
     def build(state="", leases=LEASES):
         fake = FakeHost(state, leases)
         monkeypatch.setattr(vm, "run", fake.run)
         monkeypatch.setattr(vm, "ensure_local_key", lambda: PUBKEY)
+        # 재사용 경로는 로컬 키의 존재를 확인한다. 진짜 ~/.ssherpa 를 보게
+        # 두면 키가 있는 개발 기계에서는 통과하고 CI 에서만 깨진다 —
+        # 이 프로젝트가 이미 한 번 밟은 무늬다.
+        key = tmp_path / "vm_ed25519"
+        key.write_text("fake key")
+        monkeypatch.setattr(
+            vm, "local_key_paths", lambda: (key, key.with_suffix(".pub"))
+        )
         return fake
 
     return build
@@ -295,6 +303,48 @@ class TestWaitForSsh:
             vm.wait_for_ssh(dead, "ssherpa-node-1", timeout=0)
         # SSHError 가 아니라 VmError 여야 한다 — SSHError 면 안 기다린 것이다
         assert "never accepted a connection" in excinfo.value.message
+
+
+class TestLostLocalKey:
+    """재사용 VM 은 만들어질 때의 키만 받는다.
+
+    그 키가 로컬에서 사라지면 이 VM 에는 이제 아무도 못 들어간다 — 새 키를
+    만드는 건 답이 아니다(VM 은 옛 키만 안다). 예전에는 wait_for_ssh 가
+    180초를 헛기다린 끝에 cloud-init 을 의심하는 엉뚱한 안내를 냈다.
+    """
+
+    def test_a_reused_vm_with_no_key_fails_fast_and_truthfully(
+        self, host, monkeypatch, tmp_path
+    ):
+        host(state="running")
+        # 픽스처가 tmp_path/vm_ed25519 에 가짜 키를 만들어 두므로,
+        # '지워진 키' 는 다른 이름이어야 한다
+        gone = tmp_path / "gone_ed25519"
+        monkeypatch.setattr(
+            vm, "local_key_paths", lambda: (gone, gone.with_suffix(".pub"))
+        )
+        slept = []
+        monkeypatch.setattr(vm.time, "sleep", slept.append)
+
+        with pytest.raises(vm.VmError) as excinfo:
+            vm.create(TARGET)
+
+        assert "key" in excinfo.value.message
+        # 안내는 유일한 수리(재구축)를 가리킨다 — cloud-init 이 아니라
+        assert any("down" in hint for hint in excinfo.value.hints)
+        assert not any("cloud-init" in hint for hint in excinfo.value.hints)
+        assert slept == []  # 180초 폴링 없이 즉시
+
+    def test_a_fresh_vm_is_unaffected(self, host, monkeypatch, tmp_path):
+        # 새 VM 은 키를 새로 만들면 된다 — ensure_local_key 의 몫
+        fake = host(state="")
+        gone = tmp_path / "vm_ed25519"
+        monkeypatch.setattr(
+            vm, "local_key_paths", lambda: (gone, gone.with_suffix(".pub"))
+        )
+        info = vm.create(TARGET)
+        assert info.already_existed is False
+        assert fake.ran("virt-install")
 
 
 class TestCreateFlow:
