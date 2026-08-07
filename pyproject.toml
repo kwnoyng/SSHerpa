@@ -8,11 +8,38 @@ name = "ssherpa"
 # 한쪽만 올라가고, PyPI 는 새 버전인데 `ssherpa --version` 은 옛 버전을
 # 말하는 상태가 된다 — 사용자가 엉뚱한 버전으로 버그를 신고하게 된다.
 dynamic = ["version"]
-description = "Build lab environments on on-premises servers"
+# 이 한 줄이 PyPI 검색과 구글 미리보기에 걸리는 전부다. 'kubernetes' 로
+# 검색하는 사람에게 닿으려면 그 단어가 여기 있어야 한다 — 예전 문구
+# ("Build lab environments...")에는 검색어와 겹치는 글자가 없었다.
+description = "Kubernetes on on-premises servers over nothing but SSH — k3s and RKE2, on the host or in VMs"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+keywords = [
+    "kubernetes",
+    "k3s",
+    "rke2",
+    "ssh",
+    "on-premises",
+    "bare-metal",
+    "libvirt",
+    "kvm",
+    "cluster",
+    "provisioning",
+    "homelab",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Clustering",
+    "Topic :: System :: Installation/Setup",
+    "Topic :: System :: Systems Administration",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "typer>=0.12",
     "rich>=13",
