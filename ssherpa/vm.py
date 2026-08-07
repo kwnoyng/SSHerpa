@@ -24,7 +24,7 @@ from typing import Optional
 from .cluster import API_PORT
 from .distro import Step
 from .doctor import PER_VM_MB
-from .ssh import Target, run
+from .ssh import SSHError, Target, run
 
 # VM 안에 넣을 OS. 설치 마법사가 이미 끝나 있는 완제품 디스크(qcow2)라
 # 부팅 + cloud-init 만으로 쓸 수 있는 상태가 된다.
@@ -373,15 +373,25 @@ def wait_for_ssh(vm: Target, name: str, timeout: int = SSH_TIMEOUT) -> None:
 
     임대 확인 뒤에 낀 일이 두 단계뿐이라(주소 예약, 포워딩) 창이 몇 초로
     좁고, 그래서 대개는 그냥 지나간다. 대개 지나가는 경합이 제일 나쁘다.
+
+    run() 은 결말이 둘이다: 연결이 됐으면 CommandResult 를 돌려주고,
+    연결 자체가 실패하면 SSHError 를 던진다. 여기서 기다리는 두 가지가
+    정확히 후자다 — sshd 가 아직 안 떴으면 connection refused, 계정이
+    아직 없으면 permission denied, ssh 는 둘 다 255 로 낸다. 그러니
+    값만 보고 있으면 첫 시도에서 예외로 빠져나가 한 번도 기다리지 못한다.
     """
     deadline = time.monotonic() + timeout
     detail: list[str] = []
     while True:
-        # 인증까지 끝나야 성공하는, 아무것도 하지 않는 명령.
-        result = run(vm, "true", timeout=SSH_PROBE_TIMEOUT)
-        if result.rc == 0:
-            return
-        detail = (result.stderr or "").strip().splitlines()[-2:]
+        try:
+            # 인증까지 끝나야 성공하는, 아무것도 하지 않는 명령.
+            result = run(vm, "true", timeout=SSH_PROBE_TIMEOUT)
+            if result.rc == 0:
+                return
+            detail = (result.stderr or "").strip().splitlines()[-2:]
+        except SSHError as exc:
+            # 아직 못 붙는 것은 여기서 오류가 아니라 '아직' 이다.
+            detail = [exc.message]
         if time.monotonic() >= deadline:
             break
         time.sleep(SSH_POLL_INTERVAL)

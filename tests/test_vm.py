@@ -7,7 +7,7 @@
 import pytest
 
 from ssherpa import vm
-from ssherpa.ssh import CommandResult, Target
+from ssherpa.ssh import CommandResult, SSHError, Target
 
 TARGET = Target(name="gcp-lab", host="192.0.2.10", user="ssherpa")
 PUBKEY = "ssh-ed25519 AAAATESTKEY ssherpa-vm"
@@ -218,48 +218,77 @@ class TestWaitForSsh:
     """주소를 받은 것과 접속을 받을 수 있는 것은 다른 사건이다.
 
     DHCP 임대는 cloud-init 의 network 단계에서 올라오고, ssherpa 계정과
-    그 키는 그 다음 단계에서 만들어진다. 그 사이에 접속하면 키가 아직
-    없어서 거부당하고, ssh 는 그걸 인증 실패로 보고한다.
+    그 키는 그 다음 단계에서 만들어진다.
+
+    여기서 기다리는 실패는 전부 run() 이 *예외로* 내는 종류다 — 연결
+    단계에서 죽으면 ssh 는 255 를 주고 run() 은 그걸 값이 아니라
+    SSHError 로 바꾼다. 가짜가 CommandResult(255, ...) 를 돌려주면 진짜
+    보다 관대해져서, 한 번도 안 기다리는 루프가 초록불로 통과한다
+    (실제로 그렇게 통과했다).
     """
 
-    def test_returns_as_soon_as_the_vm_answers(self, monkeypatch):
-        replies = [
-            CommandResult(255, "", "Permission denied (publickey)."),
-            CommandResult(255, "", "Permission denied (publickey)."),
-            CommandResult(0, "", ""),
-        ]
-        monkeypatch.setattr(vm, "run", lambda *a, **k: replies.pop(0))  # noqa: ARG005
-        monkeypatch.setattr(vm.time, "sleep", lambda _s: None)
-        vm.wait_for_ssh(TARGET, "ssherpa-node-1")
-        assert replies == []  # 세 번째에서 멈췄다
+    REFUSED = SSHError("connection refused (192.168.122.10:22)", ["..."])
+    DENIED = SSHError("authentication failed", ["Check the key"])
 
-    def test_the_probe_changes_nothing_on_the_vm(self, monkeypatch):
+    def raising(self, monkeypatch, *outcomes):
+        """진짜 run() 처럼 — 연결 실패는 던지고, 붙었으면 값을 준다."""
+        remaining = list(outcomes)
         sent = []
 
-        def record(target, command, timeout=30):  # noqa: ARG001
+        def fake_run(target, command, timeout=30):  # noqa: ARG001
             sent.append(command)
-            return CommandResult(0, "", "")
+            outcome = remaining.pop(0) if remaining else CommandResult(0, "", "")
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
 
-        monkeypatch.setattr(vm, "run", record)
+        monkeypatch.setattr(vm, "run", fake_run)
+        monkeypatch.setattr(vm.time, "sleep", lambda _s: None)
+        return sent, remaining
+
+    def test_it_keeps_trying_while_the_vm_refuses(self, monkeypatch):
+        # sshd 가 아직 안 떴다 -> connection refused
+        _sent, remaining = self.raising(
+            monkeypatch, self.REFUSED, self.REFUSED, CommandResult(0, "", "")
+        )
+        vm.wait_for_ssh(TARGET, "ssherpa-node-1")
+        assert remaining == []  # 세 번째에서야 멈췄다
+
+    def test_it_keeps_trying_while_the_account_is_missing(self, monkeypatch):
+        # 계정이 아직 없다 -> permission denied. 둘 다 255 다.
+        _sent, remaining = self.raising(
+            monkeypatch, self.DENIED, CommandResult(0, "", "")
+        )
+        vm.wait_for_ssh(TARGET, "ssherpa-node-1")
+        assert remaining == []
+
+    def test_the_probe_changes_nothing_on_the_vm(self, monkeypatch):
+        sent, _ = self.raising(monkeypatch, CommandResult(0, "", ""))
         vm.wait_for_ssh(TARGET, "ssherpa-node-1")
         assert sent == ["true"]
 
     def test_giving_up_blames_cloud_init_not_the_key(self, monkeypatch):
         # 여기서 인증 실패라고 안내하면 사용자는 있지도 않은 키 문제를 쫓는다
-        monkeypatch.setattr(
-            vm,
-            "run",
-            lambda *a, **k: CommandResult(  # noqa: ARG005
-                255, "", "Permission denied (publickey)."
-            ),
-        )
-        monkeypatch.setattr(vm.time, "sleep", lambda _s: None)
+        self.raising(monkeypatch, self.DENIED)
         with pytest.raises(vm.VmError) as excinfo:
             vm.wait_for_ssh(TARGET, "ssherpa-node-1", timeout=0)
         assert "never accepted a connection" in excinfo.value.message
         assert any("cloud-init" in hint for hint in excinfo.value.hints)
         # 원격이 한 말도 버리지 않는다
-        assert any("Permission denied" in hint for hint in excinfo.value.hints)
+        assert any("authentication failed" in hint for hint in excinfo.value.hints)
+
+    def test_a_real_unreachable_port_is_waited_out(self):
+        """가짜를 하나도 쓰지 않는 확인.
+
+        이 결함은 가짜가 진짜와 다른 계약을 흉내내서 생겼다. 진짜 run()
+        을 그대로 통과시키는 검사가 하나는 있어야 한다. 포트 1 은 아무도
+        듣지 않으므로 즉시 거절되고, 어디로도 나가지 않는다.
+        """
+        dead = Target(name="x", host="127.0.0.1", user="ssherpa", port=1)
+        with pytest.raises(vm.VmError) as excinfo:
+            vm.wait_for_ssh(dead, "ssherpa-node-1", timeout=0)
+        # SSHError 가 아니라 VmError 여야 한다 — SSHError 면 안 기다린 것이다
+        assert "never accepted a connection" in excinfo.value.message
 
 
 class TestCreateFlow:
