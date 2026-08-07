@@ -106,6 +106,15 @@ class TestCapableHost:
         memory_row = next(r for r in result.rows if r[0] == "Memory")
         assert "fits ~7" in memory_row[2]  # (16000-1500)//2048 = 7
 
+    def test_memory_row_answers_for_every_distro(self):
+        # VM 크기가 배포판마다 다르다. doctor 는 무엇을 고를지 모르므로
+        # 전부 답해야 '여기서 rke2 가 되나' 에 이 표가 바로 답이 된다.
+        result = diagnose(probe_output(mem_kb=16384000))  # 16 GB
+        memory_row = next(r for r in result.rows if r[0] == "Memory")
+        assert "k3s" in memory_row[2]
+        assert "rke2" in memory_row[2]
+        assert "~3" in memory_row[2]  # (16000-1500)//4096 = 3 — rke2 기준
+
 
 class TestVmCapacity:
     """표시용 추정치이자 멀티노드가 노드 수를 거절하는 기준 — 같은 식이어야
@@ -120,11 +129,20 @@ class TestVmCapacity:
         # 16 GB 를 전부 VM 에 주면 호스트가 굶는다
         assert doctor.vm_capacity(16000) == (16000 - 1500) // 2048
 
+    def test_bigger_vms_mean_fewer_of_them(self):
+        assert doctor.vm_capacity(16000, per_vm_mb=4096) == (16000 - 1500) // 4096
+
     def test_never_negative(self):
         assert doctor.vm_capacity(500) == 0
 
     def test_unknown_memory_gives_no_number(self):
         assert doctor.vm_capacity(None) is None
+
+    def test_usable_memory_is_the_fact_behind_it(self):
+        # 대수는 표시·판정용 파생값이고, 들고 다니는 사실은 메모리다
+        assert doctor.usable_memory_mb(16000) == 16000 - 1500
+        assert doctor.usable_memory_mb(None) is None
+        assert doctor.usable_memory_mb(1000) == 0  # 음수가 되면 안 된다
 
 
 class TestVirtualizationHints:

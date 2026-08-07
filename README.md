@@ -112,7 +112,7 @@ vSphere or Hyper-V:
   CPU virtualization  ✓  vmx (Intel VT-x)
   /dev/kvm            ✓  present
   libvirt             —  not installed (vm setup will install it)
-  Memory              ✓  15.6 GB — fits ~7 × 2 GB VMs
+  Memory              ✓  15.6 GB — fits ~7 k3s or ~3 rke2 VMs
   Disk                ✓  34 GB free
 
   lab-01 can run VM-backed clusters
@@ -189,7 +189,8 @@ The cluster lands in a VM on the host instead of on the host itself: the
 host stays clean, and removing the cluster is just deleting the VM. One
 command covers the whole distance — QEMU/libvirt are installed if missing,
 an Ubuntu cloud image is fetched (once per host) and booted with a
-cloud-init identity, the API port is forwarded host → VM, and k3s goes in:
+cloud-init identity, the API port is forwarded host → VM, and the
+distribution you chose goes in:
 
 ```
   Installing k3s on a VM on lab-01
@@ -217,11 +218,11 @@ cloud-init identity, the API port is forwarded host → VM, and k3s goes in:
 
 Worth knowing:
 
-- **The VM's specs are fixed on purpose** — Ubuntu 24.04, 2 CPUs, 2 GB,
-  a 10 GB thin disk, k3s inside. The host's OS is whatever you were given;
-  the VM's OS is a part SSHerpa manufactures, so there is exactly one
-  combination to support and it is actually tested. Remaining knobs (memory,
-  disk) will open as needs prove themselves.
+- **The VM's size follows the distribution** — 2 GB and a 10 GB thin disk
+  for k3s, 4 GB and 20 GB for RKE2, always Ubuntu 24.04 with 2 CPUs inside.
+  The host's OS is whatever you were given; the VM's OS is a part SSHerpa
+  manufactures, so there is a small set of combinations to support and each
+  is actually tested. Per-node sizing will open as needs prove themselves.
 - **kubectl connects through the host's address.** The VM lives on a NAT
   network only the host can see, so the host forwards port 6443 inward —
   the same trick as port-forwarding on a home router.
@@ -270,9 +271,9 @@ The limit is the same estimate `doctor` prints, so the advice and the outcome
 agree:
 
 ```
-  this host fits about 7 VM(s), but 20 were asked for
+  this host fits about 7 k3s VM(s) (2 GB each), but 20 were asked for
 
-    Each node takes 2 GB, and the host keeps some for itself.
+    Each k3s node takes 2 GB, and the host keeps some for itself.
     Try --nodes 7, or add memory to the host.
     See the estimate:  ssherpa doctor lab-01
 ```

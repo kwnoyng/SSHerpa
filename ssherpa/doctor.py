@@ -14,6 +14,8 @@ vSphere VM 은 관리자에게 요청해야 한다.
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .distro import DISTROS
+
 # VM 1대(2GB) + 호스트 몫(~1.5GB). 이보다 적으면 VM 이 떠도 OOM 으로 죽는다.
 MIN_MEMORY_MB = 3500
 HOST_RESERVE_MB = 1500
@@ -91,15 +93,30 @@ def parse_probe(stdout: str) -> HostFacts:
     return facts
 
 
-def vm_capacity(memory_mb: Optional[int]) -> Optional[int]:
-    """이 메모리로 감당할 수 있는 2GB VM 대수. 읽지 못했으면 None.
+def usable_memory_mb(memory_mb: Optional[int]) -> Optional[int]:
+    """호스트 몫을 뗀, VM 에 나눠줄 수 있는 메모리. 읽지 못했으면 None.
+
+    대수가 아니라 메모리를 사실로 든다. VM 크기는 배포판이 정하므로
+    '몇 대'는 배포판이 정해진 자리에서만 계산할 수 있다 — 대수를 들고
+    다니면 그 수가 어느 배포판 기준인지 알 수 없어진다.
+    """
+    if memory_mb is None:
+        return None
+    return max(0, memory_mb - HOST_RESERVE_MB)
+
+
+def vm_capacity(
+    memory_mb: Optional[int], per_vm_mb: int = PER_VM_MB
+) -> Optional[int]:
+    """이 메모리로 감당할 수 있는 per_vm_mb 짜리 VM 대수. 읽지 못했으면 None.
 
     doctor 가 보여주는 추정치이자, 멀티노드가 노드 수를 거절할 때 쓰는
     기준이다 — 표시와 판정이 같은 식이어야 안내와 결과가 어긋나지 않는다.
     """
-    if memory_mb is None:
+    usable = usable_memory_mb(memory_mb)
+    if usable is None:
         return None
-    return max(0, (memory_mb - HOST_RESERVE_MB) // PER_VM_MB)
+    return usable // per_vm_mb
 
 
 def _in_container(facts: HostFacts) -> bool:
@@ -244,12 +261,22 @@ def diagnose(facts: HostFacts) -> Diagnosis:
     if facts.memory_mb is None:
         result.rows.append(("Memory", "info", "could not read /proc/meminfo"))
     elif facts.memory_mb >= MIN_MEMORY_MB:
-        capacity = vm_capacity(facts.memory_mb)
+        # VM 크기가 배포판마다 다르므로 대수도 배포판별로 보여준다.
+        # doctor 는 무엇을 고를지 모른다 — 그러니 전부 답해야
+        # '여기서 rke2 가 되나' 에 이 표가 바로 답이 된다.
+        #
+        # 크기(× N GB)는 적지 않는다 — 그건 선택 프롬프트가 이미 말해주고,
+        # 여기 반복하면 줄이 기호 잔치가 된다 (실사용 지적). 사용자가
+        # 이 줄에서 가져갈 것은 --nodes 에 넣을 수 있는 수 하나다.
+        fits = " or ".join(
+            f"~{vm_capacity(facts.memory_mb, d.vm_memory_mb)} {d.name}"
+            for d in DISTROS.values()
+        )
         result.rows.append(
             (
                 "Memory",
                 "ok",
-                f"{facts.memory_mb / 1024:.1f} GB — fits ~{capacity} × 2 GB VMs",
+                f"{facts.memory_mb / 1024:.1f} GB — fits {fits} VMs",
             )
         )
     else:
