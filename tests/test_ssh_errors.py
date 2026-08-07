@@ -6,6 +6,8 @@
 
 import subprocess
 
+import pytest
+
 from ssherpa import ssh
 from ssherpa.ssh import Target
 
@@ -15,6 +17,48 @@ TARGET_WITH_KEY = Target(name="lab-01", host="h", user="admin", key="/tmp/k")
 
 def classify(stderr, target=TARGET):
     return ssh._classify(stderr, target)
+
+
+class TestRunContract:
+    """run() 의 두 결말. 이걸 잘못 알면 호출부가 조용히 어긋난다.
+
+    실제로 어긋난 적이 있다. wait_for_ssh 가 연결 실패를 rc 255 인 값으로
+    받는다고 보고 폴링 루프를 짰는데, run() 은 그걸 던진다 — 루프는 첫
+    시도에서 빠져나갔고, 그 아래 코드는 전부 도달하지 못했다. 가짜가
+    값을 돌려주도록 만들어져 있어서 테스트는 초록불이었다.
+    """
+
+    def fake_ssh(self, monkeypatch, returncode, stderr=""):
+        monkeypatch.setattr(ssh.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(
+            ssh.subprocess,
+            "run",
+            lambda *_a, **_k: subprocess.CompletedProcess([], returncode, "out", stderr),
+        )
+
+    def test_a_connection_failure_is_raised_not_returned(self, monkeypatch):
+        # ssh 는 연결 단계 실패를 전부 255 로 낸다
+        self.fake_ssh(monkeypatch, 255, "ssh: connect to host h port 22: "
+                                        "Connection refused")
+        with pytest.raises(ssh.SSHError):
+            ssh.run(TARGET, "true")
+
+    def test_a_command_failure_comes_back_as_a_value(self, monkeypatch):
+        # 붙긴 했고 명령이 실패한 것 — 이건 오류가 아니라 대답이다
+        self.fake_ssh(monkeypatch, 1, "no such file")
+        result = ssh.run(TARGET, "test -f /nope")
+        assert result.rc == 1
+
+    def test_success_comes_back_as_a_value(self, monkeypatch):
+        self.fake_ssh(monkeypatch, 0)
+        assert ssh.run(TARGET, "true").rc == 0
+
+    def test_no_caller_ever_sees_rc_255(self, monkeypatch):
+        # 255 를 값으로 받는 코드는 도달할 수 없다. 그걸 전제한 분기는
+        # 전부 죽은 코드다.
+        self.fake_ssh(monkeypatch, ssh.SSH_FAILURE_RC, "Permission denied (publickey).")
+        with pytest.raises(ssh.SSHError):
+            ssh.run(TARGET, "true")
 
 
 class TestResolveHostname:
