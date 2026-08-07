@@ -89,10 +89,17 @@ def node_name(index: int) -> str:
     return f"{VM_PREFIX}node-{index}"
 
 
-def specs_for(count: int, memory_mb: int = PER_VM_MB) -> list[VmSpec]:
-    """노드 수만큼의 사양 목록. 첫 번째가 server 가 된다."""
+def specs_for(
+    count: int, memory_mb: int = PER_VM_MB, disk_gb: int = 10
+) -> list[VmSpec]:
+    """노드 수만큼의 사양 목록. 첫 번째가 server 가 된다.
+
+    크기는 배포판이 정한다(distro.vm_memory_mb / vm_disk_gb). 이미 있는
+    VM 에는 이 값이 닿지 않는다 — create() 는 있는 VM 을 그대로 쓴다.
+    """
     return [
-        VmSpec(name=node_name(i), memory_mb=memory_mb) for i in range(1, count + 1)
+        VmSpec(name=node_name(i), memory_mb=memory_mb, disk_gb=disk_gb)
+        for i in range(1, count + 1)
     ]
 
 

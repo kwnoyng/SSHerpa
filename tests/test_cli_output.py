@@ -260,6 +260,178 @@ class TestStatusSurvivesALostConnection:
         assert "running" in out
 
 
+class TestStatusLeadsWithTheAnswer:
+    """VM 클러스터가 도는 호스트에서 'k3s — not installed' 두 줄이 먼저
+    나오면, 멀쩡한 클러스터 앞에서 아무것도 없다는 인상을 준다 (실사용
+    지적). 답을 먼저, '없음'은 마지막에.
+    """
+
+    def _wire(self, monkeypatch, *, vms, host_installed, inside_running):
+        from ssherpa import cli
+        from ssherpa.cluster import DistroStatus, HostStatus
+        from ssherpa.ssh import Target
+        from ssherpa.vm import VmInfo
+
+        target = Target(name="lab-01", host="192.0.2.10")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+
+        def status(node, _known):
+            if getattr(node, "in_vm", False):
+                return HostStatus(
+                    distros=[
+                        DistroStatus("k3s", installed=False, service_state=""),
+                        DistroStatus(
+                            "rke2",
+                            installed=inside_running,
+                            service_state="active" if inside_running else "",
+                        ),
+                    ],
+                    node_lines=(
+                        ["node-1 Ready control-plane 5m v1"] if inside_running else []
+                    ),
+                )
+            return HostStatus(
+                distros=[
+                    DistroStatus(
+                        "k3s",
+                        installed=host_installed,
+                        service_state="active" if host_installed else "",
+                    ),
+                    DistroStatus("rke2", installed=False, service_state=""),
+                ]
+            )
+
+        monkeypatch.setattr(cli.cluster, "status", status)
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: list(vms))
+        monkeypatch.setattr(cli.vm_mod, "vm_state", lambda *_a, **_k: "running")
+        monkeypatch.setattr(
+            cli.vm_mod,
+            "find",
+            lambda *_a, **_k: (
+                VmInfo(vms[0], "192.168.122.10", "52:54:00:00:00:01", True)
+                if vms
+                else None
+            ),
+        )
+        monkeypatch.setattr(
+            cli.vm_mod,
+            "vm_target",
+            lambda _h, info: Target(name=f"vm/{info.name}", host=info.ip),
+        )
+        return cli
+
+    def test_a_vm_cluster_is_not_announced_with_not_installed(self, monkeypatch):
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=False,
+            inside_running=True,
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "not installed" not in out
+        assert "rke2 in the VMs" in out
+
+    def test_the_cluster_line_comes_before_the_vm_list(self, monkeypatch):
+        # 답(클러스터)이 목록(VM)보다 먼저다
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=False,
+            inside_running=True,
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert out.index("cluster:") < out.index("vm:")
+
+    def test_the_hosts_cleanliness_is_still_stated(self, monkeypatch):
+        # 표를 걷어낸 자리의 정보는 남는다 — 호스트 직접 설치가 없다는
+        # 사실은 down/up 의 동작을 예측하는 데 쓰인다
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=False,
+            inside_running=True,
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        assert "host itself has nothing installed" in captured.get()
+
+    def test_an_empty_host_keeps_the_table(self, monkeypatch):
+        # 아무것도 없을 때는 'not installed' 가 곧 답이다
+        cli = self._wire(
+            monkeypatch, vms=[], host_installed=False, inside_running=False
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "not installed" in out
+        assert "Nothing installed" in out
+
+    def test_a_host_mode_install_keeps_the_table(self, monkeypatch):
+        cli = self._wire(
+            monkeypatch, vms=[], host_installed=True, inside_running=False
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "k3s" in out
+        assert "installed" in out
+
+    def test_a_host_install_beside_vms_is_called_a_fight(self, monkeypatch):
+        # SSHerpa 는 이 상태를 만들지 않는다 — 손으로 깔았을 때만 생긴다.
+        # 둘 다 초록불로 보여주면 6443 싸움이 숨는다: 포워딩이 바깥
+        # 트래픽을 VM 으로 보내므로 호스트 쪽은 밖에서 조용히 끊긴다.
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=True,
+            inside_running=True,
+        )
+        with (
+            cli.console.capture() as out_cap,
+            cli.err_console.capture() as err_cap,
+        ):
+            cli.status("lab-01")
+        assert "both need port 6443" in err_cap.get()
+        assert "cut off" in err_cap.get()
+        # 둘 다 사실대로 보인다 — 경고는 추가지 은폐가 아니다
+        assert "k3s" in out_cap.get()
+        assert "rke2 in the VMs" in out_cap.get()
+
+    def test_the_fight_warning_suggests_a_command_that_exists(self, monkeypatch):
+        # 예전 충돌 안내는 down --distro 를 권했는데 down 에 그 옵션이 없다.
+        # 안내가 시키는 명령은 실행 가능해야 한다.
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=True,
+            inside_running=True,
+        )
+        with cli.console.capture(), cli.err_console.capture() as err_cap:
+            cli.status("lab-01")
+        err = err_cap.get()
+        assert "ssherpa down lab-01" in err
+        assert "down lab-01 --distro" not in err
+
+    def test_empty_vms_are_not_reported_as_no_cluster(self, monkeypatch):
+        # VM 은 있는데 안이 비었다 — 만들다 만 상태. 침묵하면 '클러스터가
+        # 없다' 로 읽히므로, 상태와 다음 걸음을 그대로 말한다.
+        cli = self._wire(
+            monkeypatch,
+            vms=["ssherpa-node-1"],
+            host_installed=False,
+            inside_running=False,
+        )
+        with cli.console.capture() as captured:
+            cli.status("lab-01")
+        out = captured.get()
+        assert "nothing installed in the VMs yet" in out
+        assert "up lab-01 --vm" in out
+
+
 class TestDistroSelection:
     """빈 호스트에서만 고를 일이 생긴다: 사람은 화살표, 스크립트는 --distro,
     지정 없는 스크립트는 k3s 기본 + 그 사실을 로그에 남긴다."""
@@ -412,7 +584,11 @@ class TestNodeCapacity:
             cli.virt,
             "setup",
             lambda *_a, **_k: virt.SetupResult(
-                already_installed=True, virsh_version="10.0.0", vm_capacity=capacity
+                already_installed=True,
+                virsh_version="10.0.0",
+                # 대수가 아니라 메모리가 사실이다 — 대수는 배포판이 정해진
+                # 자리에서 계산된다 (k3s 2GB 기준으로 환산해 준다)
+                usable_memory_mb=None if capacity is None else capacity * 2048,
             ),
         )
         def built(*_a, **_k):
@@ -471,7 +647,8 @@ class TestExistingClusterSize:
             cli.virt,
             "setup",
             lambda *_a, **_k: virt.SetupResult(
-                already_installed=True, virsh_version="10.0.0", vm_capacity=7
+                already_installed=True, virsh_version="10.0.0",
+                usable_memory_mb=7 * 2048,
             ),
         )
 
@@ -519,6 +696,238 @@ class TestExistingClusterSize:
         with pytest.raises(RuntimeError):
             cli.up("lab-01", distro=None, vm_mode=True, nodes=3, assume_yes=True)
         assert built == ["ssherpa-node-1"]  # create 가 첫 노드에서 멈춘다
+
+
+class TestBrokenClusterShapes:
+    """이름이 1..N 로 연속일 때만 개수 기반 계획이 성립한다.
+
+    VM 을 손으로(virsh) 지우는 것은 인정된 사용법이다 — 고아 예약 청소가
+    그 실측에서 나왔다. 그렇게 생긴 구멍을 모른 채 세면 server 재사용
+    전제가 무너진다: 실측에서 rke2 컨트롤플레인이 기본 크기 2GB 로
+    만들어지고, 빈 VM 에게 배포판을 물었다.
+    """
+
+    def _wire(self, monkeypatch, existing):
+        from ssherpa import cli, virt
+        from ssherpa.ssh import Target
+        from ssherpa.vm import VmInfo
+
+        target = Target(name="lab-01", host="192.0.2.10")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        monkeypatch.setattr(cli, "_api_address", lambda _t: "192.0.2.10")
+        monkeypatch.setattr(cli, "_installed_on", lambda _n: [])
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: list(existing))
+        monkeypatch.setattr(
+            cli.virt,
+            "setup",
+            lambda *_a, **_k: virt.SetupResult(
+                already_installed=True, virsh_version="10", usable_memory_mb=14000
+            ),
+        )
+
+        built = []
+
+        def create(_t, *, spec, reporter=None):  # noqa: ARG001
+            built.append(spec.name)
+            return VmInfo(spec.name, "192.168.122.10", "52:54:00:00:00:01", True)
+
+        monkeypatch.setattr(cli.vm_mod, "create", create)
+        monkeypatch.setattr(
+            cli.vm_mod,
+            "vm_target",
+            lambda _h, info: Target(name=f"vm/{info.name}", host=info.ip),
+        )
+
+        def stop(*_a, **_k):
+            raise RuntimeError("stop at expose")
+
+        monkeypatch.setattr(cli.vm_mod, "expose_api", stop)
+        return cli, built
+
+    def test_a_missing_server_vm_is_refused_not_rebuilt(self, monkeypatch):
+        import typer
+
+        cli, built = self._wire(
+            monkeypatch, ["ssherpa-node-2", "ssherpa-node-3"]
+        )
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit):
+            cli.up("lab-01", distro="rke2", vm_mode=True, nodes=None, assume_yes=True)
+        out = captured.get()
+        assert "no server VM" in out
+        assert "join token" in out  # 왜 제자리 수리가 안 되는지
+        assert "down lab-01" in out
+        # 복구 제안은 원래 크기다 — node-2,3 이 남았으면 3노드였다
+        assert "--nodes 3" in out
+        assert built == []  # 기본 크기 server 를 짓기 전에 멈췄다
+
+    def test_a_gap_in_the_names_is_refused(self, monkeypatch):
+        import typer
+
+        cli, built = self._wire(
+            monkeypatch, ["ssherpa-node-1", "ssherpa-node-3"]
+        )
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit):
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=None, assume_yes=True)
+        out = captured.get()
+        assert "gap" in out
+        assert "ssherpa-node-3" in out
+        assert built == []
+
+    def test_contiguous_names_still_proceed(self, monkeypatch):
+        cli, built = self._wire(
+            monkeypatch, ["ssherpa-node-1", "ssherpa-node-2"]
+        )
+        with pytest.raises(RuntimeError, match="stop at expose"):
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=None, assume_yes=True)
+        assert built  # 정상 경로는 그대로 지나간다
+
+
+class TestDistroChoiceLines:
+    """프롬프트의 메모리 숫자는 모드를 따라야 한다.
+
+    호스트 모드는 '이 호스트에서 도는가'(바닥)가, vm 모드는 '얼마짜리
+    VM 을 만드는가'(할당)가 답이다. 실측: 프롬프트는 'runs in 1 GB' 인데
+    doctor 는 '2 GB k3s VMs' 라고 답하고 있었다 — 같은 화면 두 개가
+    다른 수를 말하면 한쪽이 거짓으로 읽힌다.
+    """
+
+    def _titles(self, vm):
+        from ssherpa import cli
+
+        return {value: title for title, value in cli._distro_choices(vm=vm)}
+
+    def test_vm_mode_shows_the_vm_size(self):
+        titles = self._titles(vm=True)
+        assert "2 GB VM" in titles["k3s"]  # doctor 의 '2 GB k3s' 와 같은 수
+        assert "4 GB VM" in titles["rke2"]
+
+    def test_host_mode_shows_the_floor(self):
+        titles = self._titles(vm=False)
+        assert "~1 GB" in titles["k3s"]
+        assert "~4 GB" in titles["rke2"]  # 3.4GB 를 내림해 3 이라 하면 모자란 호스트에 권하게 된다
+
+    def test_the_floor_does_not_leak_into_vm_mode(self):
+        # k3s 는 바닥(1GB)과 VM 크기(2GB)가 다른 유일한 배포판 —
+        # 여기가 섞이면 실측했던 그 어긋남이 되살아난다
+        assert "1 GB" not in self._titles(vm=True)["k3s"]
+
+    def test_the_qualitative_part_survives_in_both(self):
+        for vm in (True, False):
+            titles = self._titles(vm=vm)
+            assert "lightweight" in titles["k3s"]
+            assert "security-hardened" in titles["rke2"]
+
+
+class TestVmDistroSelection:
+    """VM 모드의 배포판 선택 — 답은 VM 안에 있고, 빈 호스트에서만 고른다.
+
+    0.5.5 까지 VM 모드는 k3s 전용이었다(VM 이 2GB 고정이라 rke2 가 못
+    들어갔다). 크기가 배포판을 따라가면서 그 이유가 사라졌다 — 이제
+    호스트 모드와 같은 규칙으로 정한다.
+    """
+
+    def _wire(self, monkeypatch, *, existing, inside, usable_mb=6 * 2048):
+        from ssherpa import cli, virt
+        from ssherpa.ssh import Target
+        from ssherpa.vm import VmInfo
+
+        target = Target(name="lab-01", host="192.0.2.10")
+        monkeypatch.setattr(cli, "_load_target", lambda _n: target)
+        monkeypatch.setattr(cli, "_api_address", lambda _t: "192.0.2.10")
+
+        def installed_on(node):
+            # 호스트 자신(in_vm=False)과 VM 안(in_vm=True)은 다른 질문이다
+            return list(inside) if getattr(node, "in_vm", False) else []
+
+        monkeypatch.setattr(cli, "_installed_on", installed_on)
+        monkeypatch.setattr(cli.vm_mod, "list_vms", lambda _t: list(existing))
+        monkeypatch.setattr(
+            cli.virt,
+            "setup",
+            lambda *_a, **_k: virt.SetupResult(
+                already_installed=True,
+                virsh_version="10.0.0",
+                usable_memory_mb=usable_mb,
+            ),
+        )
+
+        built = []
+
+        def create(_t, *, spec, reporter=None):  # noqa: ARG001
+            built.append(spec)
+            return VmInfo(spec.name, "192.168.122.10", "52:54:00:00:00:01", True)
+
+        monkeypatch.setattr(cli.vm_mod, "create", create)
+        monkeypatch.setattr(
+            cli.vm_mod,
+            "vm_target",
+            lambda _host, info: Target(name=f"vm/{info.name}", host=info.ip),
+        )
+
+        def stop(*_a, **_k):
+            # 여기까지 왔으면 선택·검사·생성이 전부 끝난 것이다
+            raise RuntimeError("stop at expose")
+
+        monkeypatch.setattr(cli.vm_mod, "expose_api", stop)
+        return cli, built
+
+    def test_rke2_is_no_longer_refused(self, monkeypatch):
+        # 빈 호스트 + --distro rke2 → 4GB/20GB 짜리 VM 으로 만든다
+        cli, built = self._wire(monkeypatch, existing=[], inside=[])
+        with pytest.raises(RuntimeError, match="stop at expose"):
+            cli.up("lab-01", distro="rke2", vm_mode=True, nodes=1, assume_yes=True)
+        assert built[0].memory_mb == 4096
+        assert built[0].disk_gb == 20
+
+    def test_k3s_keeps_its_size(self, monkeypatch):
+        # 기존 사용자의 VM 크기가 바뀌면 용량 계산과 재사용이 다 흔들린다
+        cli, built = self._wire(monkeypatch, existing=[], inside=[])
+        with pytest.raises(RuntimeError, match="stop at expose"):
+            cli.up("lab-01", distro="k3s", vm_mode=True, nodes=1, assume_yes=True)
+        assert built[0].memory_mb == 2048
+        assert built[0].disk_gb == 10
+
+    def test_mismatch_with_whats_inside_is_refused(self, monkeypatch):
+        # k3s 가 든 VM 에 rke2 를 얹으면 둘 다 6443 을 잡으려 한다 —
+        # 호스트 모드가 거절하는 것과 같은 이유로 거절한다
+        import typer
+
+        cli, built = self._wire(
+            monkeypatch, existing=["ssherpa-node-1"], inside=["k3s"]
+        )
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit):
+            cli.up("lab-01", distro="rke2", vm_mode=True, nodes=1, assume_yes=True)
+        out = captured.get()
+        assert "k3s is already installed" in out
+        assert "down lab-01" in out
+
+    def test_whats_inside_wins_without_a_request(self, monkeypatch):
+        # 재실행이 배포판을 물어보면 안 된다 — 이미 결정된 것은 다시 묻지 않는다
+        cli, built = self._wire(
+            monkeypatch, existing=["ssherpa-node-1"], inside=["k3s"]
+        )
+        with cli.console.capture() as captured, pytest.raises(RuntimeError):
+            cli.up("lab-01", distro=None, vm_mode=True, nodes=1, assume_yes=True)
+        assert "k3s runs inside these VMs" in captured.get()
+
+    def test_capacity_is_counted_in_the_chosen_distros_size(self, monkeypatch):
+        # usable 12288MB: k3s(2GB) 로는 6대, rke2(4GB) 로는 3대다.
+        # 4대 요청은 k3s 면 통과, rke2 면 거절이어야 한다.
+        import typer
+
+        cli, built = self._wire(monkeypatch, existing=[], inside=[])
+        with cli.err_console.capture() as captured, pytest.raises(typer.Exit):
+            cli.up("lab-01", distro="rke2", vm_mode=True, nodes=4, assume_yes=True)
+        out = captured.get()
+        assert "3 rke2" in out
+        assert "4 GB" in out
+        assert built == []  # 만들기 전에 거절했다
+
+    def test_the_same_count_passes_as_k3s(self, monkeypatch):
+        cli, built = self._wire(monkeypatch, existing=[], inside=[])
+        with pytest.raises(RuntimeError, match="stop at expose"):
+            cli.up("lab-01", distro="k3s", vm_mode=True, nodes=4, assume_yes=True)
+        assert len(built) == 4
 
 
 class TestLocalTracesAreRemoved:
@@ -740,3 +1149,23 @@ class TestLeftoverForwardingIsRemovable:
             cli.down("lab-01", assume_yes=True)
         assert "Nothing is installed" in captured.get()
         assert closed == []
+
+
+class TestSourceEncoding:
+    def test_no_source_file_carries_a_bom(self):
+        # 실측: PowerShell 의 Set-Content -Encoding utf8 이 BOM 을 붙이고,
+        # Get-Content 는 UTF-8 을 cp949 로 읽어 한글 docstring 을 통째로
+        # 깨뜨렸다. 소스는 BOM 없는 UTF-8 이어야 한다.
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "ssherpa"
+        for source in sorted(root.glob("*.py")):
+            raw = source.read_bytes()
+            assert not raw.startswith(b"\xef\xbb\xbf"), f"{source.name} has a BOM"
+            raw.decode("utf-8")  # 깨진 인코딩이면 여기서 터진다
+
+    def test_the_package_docstring_is_not_mojibake(self):
+        import ssherpa
+
+        # cp949 왕복으로 깨지면 한글이 '?곕Ⅴ??' 류의 잔해가 된다
+        assert "셰르파" in (ssherpa.__doc__ or "")

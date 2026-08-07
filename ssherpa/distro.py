@@ -43,11 +43,30 @@ class Distro:
     kubectl: str  # 노드 상태를 확인할 때 쓸 kubectl 경로
     min_memory_mb: int  # 이보다 적으면 설치해도 노드가 Ready 가 되지 않는다
     service: str  # systemd 유닛 이름. status 로 실행 여부를 본다
-    summary: str  # 선택 프롬프트에 보여줄 한 줄 설명
+    summary: str  # 선택 프롬프트에 보여줄 성격 한마디 (메모리 얘기는 뺀다)
     config_path: str  # tls-san 을 담는 설정 파일 (SSHerpa 가 소유·관리)
     serving_cert_path: str  # API 서버 serving 인증서 — SAN 검사에 쓴다
     token_path: str  # server 가 발급한 합류 토큰. agent 가 이걸로 들어온다
     join_port: int  # agent 가 두드릴 포트. 배포판마다 다르다
+    # VM 모드에서 이 배포판을 담을 VM 의 크기. min_memory_mb 는 '이보다
+    # 작으면 안 뜬다'는 바닥이고, 이것은 '이만큼 주고 만든다'는 계획이다 —
+    # 배포판 자신과 그 위에 올릴 파드의 몫까지 들어간다.
+    vm_memory_mb: int
+    vm_disk_gb: int
+
+    def memory_note(self, vm: bool = False) -> str:
+        """선택 프롬프트에 붙일 메모리 한마디. 모드마다 중요한 수가 다르다.
+
+        호스트 모드는 '이 호스트에서 도는가'(바닥, min_memory_mb)가 답이고,
+        vm 모드는 '얼마짜리 VM 을 만드는가'(할당, vm_memory_mb)가 답이다.
+        한 문구로 둘 다 말하면 한쪽이 거짓이 된다 — 실측: 프롬프트는
+        'runs in 1 GB' 인데 doctor 는 '2 GB k3s VMs' 라고 답하고 있었다.
+        """
+        if vm:
+            return f"{self.vm_memory_mb // 1024} GB VM"
+        # 올림이다 — 내림하면 3.4GB 가 필요한 rke2 를 3GB 호스트에 권하게 된다
+        gb = -(-self.min_memory_mb // 1024)
+        return f"needs ~{gb} GB"
 
     def install_steps(self, api_address: str) -> list[Step]:
         raise NotImplementedError
@@ -172,13 +191,17 @@ class K3s(Distro):
             # k3s 는 512MB 에서도 뜨지만 여유가 없으면 파드를 못 띄운다.
             min_memory_mb=900,
             service="k3s",
-            summary="lightweight, installs in about 20s, runs in 1 GB",
+            summary="lightweight, installs in about 20s",
             config_path="/etc/rancher/k3s/config.yaml",
             serving_cert_path=(
                 "/var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt"
             ),
             token_path="/var/lib/rancher/k3s/server/node-token",
             join_port=6443,  # k3s 는 API 포트로 합류를 받는다
+            # doctor.PER_VM_MB 와 같은 값이어야 한다 — doctor 의 용량 추정과
+            # 실제 생성 크기가 어긋나면 안내와 결과가 갈라진다 (테스트로 고정).
+            vm_memory_mb=2048,
+            vm_disk_gb=10,
         )
 
     def install_steps(self, api_address: str) -> list[Step]:
@@ -220,7 +243,7 @@ class RKE2(Distro):
             # Pending 에 걸려 노드가 영영 NotReady 로 남는다.
             min_memory_mb=3500,
             service="rke2-server",
-            summary="security-hardened, closer to production, needs 4 GB",
+            summary="security-hardened, closer to production",
             config_path="/etc/rancher/rke2/config.yaml",
             serving_cert_path=(
                 "/var/lib/rancher/rke2/server/tls/serving-kube-apiserver.crt"
@@ -229,6 +252,13 @@ class RKE2(Distro):
             # RKE2 는 API(6443) 와 별도로 supervisor 포트로 합류를 받는다.
             # 6443 으로 보내면 붙는 듯하다 조용히 실패한다.
             join_port=9345,
+            # min(3500)에 여유를 얹은 값. 3500 은 '2GB 에서 CNI 파드가
+            # Pending 으로 남는다'는 실측에서 나온 바닥이지, 그 값이면
+            # 충분하다는 실측이 아니다 — VM 에 올려보고 재서 조정한다.
+            vm_memory_mb=4096,
+            # 이미지가 k3s 보다 크다(하드닝된 컴포넌트 셋). 얇은 파일이라
+            # 처음부터 다 차지하지는 않는다.
+            vm_disk_gb=20,
         )
 
     def uninstall_steps(self) -> list[Step]:

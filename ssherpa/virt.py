@@ -151,9 +151,11 @@ def _run_step(target: Target, step: Step) -> None:
 class SetupResult:
     already_installed: bool  # virsh 가 이미 있었다 (패키지 설치를 건너뜀)
     virsh_version: str
-    # 이 호스트가 감당할 수 있는 VM 대수. 노드 수를 요청받은 쪽이
-    # 시작 전에 거절할 수 있도록 진단에서 그대로 들고 나온다.
-    vm_capacity: Optional[int] = None
+    # 대수가 아니라 사실을 든다. VM 크기는 배포판이 정하므로 '몇 대'는
+    # 배포판이 정해진 자리에서만 계산할 수 있다 — 대수를 들고 다니면
+    # 그 수가 어느 배포판 기준인지 알 수 없어진다.
+    usable_memory_mb: Optional[int] = None
+    disk_free_gb: Optional[float] = None
 
 
 def setup(target: Target, reporter=None) -> SetupResult:
@@ -169,7 +171,7 @@ def setup(target: Target, reporter=None) -> SetupResult:
         probe = run(target, SETUP_PROBE, timeout=60)
         head, _, os_text = probe.stdout.partition("SSHERPA_OSRELEASE")
         facts = doctor.parse_probe(head)
-        capacity = doctor.vm_capacity(facts.memory_mb)
+        usable = doctor.usable_memory_mb(facts.memory_mb)
 
         diagnosis = doctor.diagnose(facts)
         if not diagnosis.capable:
@@ -220,5 +222,6 @@ def setup(target: Target, reporter=None) -> SetupResult:
     return SetupResult(
         already_installed=already,
         virsh_version=state.virsh_version,
-        vm_capacity=capacity,
+        usable_memory_mb=usable,
+        disk_free_gb=facts.disk_free_gb,
     )

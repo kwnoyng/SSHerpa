@@ -41,6 +41,22 @@ class TestDistroRegistry:
         for name in distro_mod.DISTROS:
             assert name in listed
 
+    @pytest.mark.parametrize("name", ["k3s", "rke2"])
+    def test_vm_size_covers_the_distros_own_minimum(self, name):
+        # vm_memory_mb 는 '이만큼 주고 만든다'는 계획이고 min_memory_mb 는
+        # '이보다 작으면 안 뜬다'는 바닥이다. 계획이 바닥보다 작으면
+        # 만든 VM 에 설치가 스스로 거절당한다.
+        d = distro_mod.get(name)
+        assert d.vm_memory_mb >= d.min_memory_mb
+        assert d.vm_disk_gb > 0
+
+    def test_k3s_vm_size_matches_the_doctor_estimate(self):
+        # doctor 의 용량 추정(PER_VM_MB)과 실제 생성 크기가 어긋나면
+        # 'fits ~7' 이라 해놓고 다른 수에서 거절하게 된다
+        from ssherpa.doctor import PER_VM_MB
+
+        assert distro_mod.get("k3s").vm_memory_mb == PER_VM_MB
+
 
 class TestInstallSteps:
     """설치 절차는 배포판마다 단계 수가 다르다."""

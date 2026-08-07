@@ -65,10 +65,13 @@ app = typer.Typer(
 target_app = typer.Typer(help="Manage targets (server address book).", no_args_is_help=True)
 app.add_typer(target_app, name="target")
 
-USAGE_HINTS = [
-    "Registered target:   ssherpa check lab-01",
-    "One-off check:       ssherpa check --host 10.0.0.10 --user admin",
-]
+def _usage_hints(verb: str) -> list[str]:
+    """인자 사용법 안내. 명령 이름은 지금 실행한 그 명령으로 적는다 —
+    doctor 의 오류가 check 를 시키면 사용자는 엉뚱한 명령을 배운다."""
+    return [
+        f"Registered target:   ssherpa {verb} lab-01",
+        f"One-off host:        ssherpa {verb} --host 10.0.0.10 --user admin",
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -129,6 +132,7 @@ def _resolve_target(
     user: Optional[str],
     port: Optional[int],
     key: Optional[str],
+    verb: str = "check",
 ) -> Target:
     """등록된 타겟 이름이든 일회성 --host 든 하나의 Target 으로 만든다.
 
@@ -157,16 +161,18 @@ def _resolve_target(
                 [
                     "Connection details come from the registered target.",
                     "",
-                    *USAGE_HINTS,
+                    *_usage_hints(verb),
                     "",
-                    f"Change what is registered:  ssherpa target add {name} ...",
+                    # add 를 시키면 '이미 등록됨' 거절이 다시 update 를
+                    # 가리킨다 — 안내가 원을 그리면 두 번 실패하고 도착한다.
+                    f"Change what is registered:  ssherpa target update {name} ...",
                 ],
             )
         with _surface_errors():
             return get_target(name)
 
     if not host:
-        _fail("A target name or --host is required.", USAGE_HINTS)
+        _fail("A target name or --host is required.", _usage_hints(verb))
     if looks_like_option(host):
         _fail(f"'{host}' is not a valid address.", HOST_OPTION_HINT)
     return Target(name=None, host=host, user=user, port=port, key=key)
@@ -388,7 +394,7 @@ def doctor(
     "can this host create VMs". A host that fails here can still run
     host-mode clusters — the verdict says which way to go.
     """
-    target = _resolve_target(name, host, user, port, key)
+    target = _resolve_target(name, host, user, port, key, verb="doctor")
 
     with _surface_errors():
         result = run(target, doctor_mod.DOCTOR_PROBE, timeout=60)
@@ -460,7 +466,7 @@ def check(
     It does not leave a session open.
     """
     # 인벤토리에 등록된 타겟이든, 일회성 --host 든 둘 다 받는다.
-    target = _resolve_target(name, host, user, port, key)
+    target = _resolve_target(name, host, user, port, key, verb="check")
 
     label = target.name or target.host
 
@@ -549,15 +555,28 @@ def _interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def _prompt_for_distro():
+def _distro_choices(vm: bool = False) -> list[tuple[str, str]]:
+    """선택 프롬프트의 (표시줄, 값) 목록.
+
+    메모리 숫자는 모드를 따른다 — 호스트 모드는 바닥, vm 모드는 VM 크기.
+    doctor 가 보여주는 수와 같은 수가 나와야 두 화면이 서로 다른 말을
+    하지 않는다.
+    """
+    return [
+        (f"{o.name:<6} {o.summary} — {o.memory_note(vm)}", o.name)
+        for o in distro_mod.DISTROS.values()
+    ]
+
+
+def _prompt_for_distro(vm: bool = False):
     """설치할 배포판을 화살표로 고르게 한다. 대화형 터미널에서만 호출된다."""
     options = list(distro_mod.DISTROS.values())
     try:
         answer = questionary.select(
             "Which Kubernetes distribution?",
             choices=[
-                questionary.Choice(title=f"{o.name:<6} {o.summary}", value=o.name)
-                for o in options
+                questionary.Choice(title=title, value=value)
+                for title, value in _distro_choices(vm)
             ],
         ).ask()
     except Exception:  # 프롬프트를 띄울 수 없는 터미널
@@ -591,7 +610,11 @@ def _installed_on(node) -> list[str]:
 
 
 def _distro_to_install(
-    node, requested: Optional[str] = None, installed: Optional[list] = None
+    node,
+    requested: Optional[str] = None,
+    installed: Optional[list] = None,
+    where: str = "on this host",
+    vm: bool = False,
 ):
     """설치 대상을 정한다.
 
@@ -600,16 +623,19 @@ def _distro_to_install(
     사람이 있으면 화살표로 묻고, 스크립트는 --distro 로 지정하며,
     지정 없는 스크립트는 k3s 를 기본으로 쓰되 그 사실을 로그에 남긴다 —
     조용히 내린 결정은 나중에 읽는 사람에게 미스터리가 된다.
+
+    vm 모드도 같은 규칙을 쓴다 — where 만 바뀐다. 규칙이 두 벌이 되면
+    한쪽만 고쳐지는 날이 온다.
     """
     if installed is None:
         installed = _installed_on(node)
 
     if len(installed) > 1:
         _fail(
-            "More than one distribution is installed on this host",
+            f"More than one distribution is installed {where}",
             [
                 "They cannot coexist — remove them and start clean:",
-                f"    ssherpa down {node.target.name}",
+                f"    ssherpa down {node.cli_name or node.target.name}",
             ],
         )
 
@@ -617,13 +643,13 @@ def _distro_to_install(
         existing = installed[0]
         if requested and requested != existing:
             _fail(
-                f"{existing} is already installed on this host",
+                f"{existing} is already installed {where}",
                 [
-                    "Kubernetes distributions cannot share a host — "
+                    "Kubernetes distributions cannot share a cluster — "
                     "they all bind port 6443.",
                     "Remove the existing one first:",
                     "",
-                    f"    ssherpa down {node.target.name}",
+                    f"    ssherpa down {node.cli_name or node.target.name}",
                 ],
             )
         return _resolve_distro(existing)
@@ -642,7 +668,7 @@ def _distro_to_install(
         )
         return _resolve_distro("k3s")
 
-    return _prompt_for_distro()
+    return _prompt_for_distro(vm)
 
 
 def _load_target(name: str) -> Target:
@@ -811,17 +837,6 @@ def _up_vm(
             ],
         )
 
-    # VM 사양이 2 GB 로 고정돼 있어 지금은 k3s 만 들어간다.
-    if requested and requested != "k3s":
-        _fail(
-            "VM mode currently installs k3s only",
-            [
-                f"The VM has 2 GB of memory and {requested} needs more.",
-                "Omit --distro (or pass --distro k3s).",
-            ],
-        )
-    chosen = _resolve_distro("k3s")
-
     # 만들기 전에 정해둔다. 인증서에 한 번 박히면 바꾸는 데 재발급이 든다.
     api_address = _api_address(target)
 
@@ -849,34 +864,97 @@ def _up_vm(
             ],
         )
 
-    console.print()
-    where = "a VM" if nodes == 1 else f"{nodes} VMs"
-    console.print(
-        Padding(
-            f"Installing [bold]{chosen.name}[/bold] on {where} on [bold]{name}[/bold]",
-            (0, 0, 0, 2),
+    # 이름이 1..N 로 연속일 때만 개수 기반 계획이 성립한다. VM 을 손으로
+    # (virsh) 지우는 것은 이 프로젝트가 인정한 사용법이고(고아 예약 청소가
+    # 그 실측에서 나왔다), 그렇게 생긴 구멍을 모르는 채 세면:
+    #   - node-1 이 없으면 '기존 server 재사용' 전제가 무너져, 새 server 를
+    #     기본 크기(2GB)로 짓고 빈 VM 에게 배포판을 묻는다 (실측)
+    #   - 중간이 비면 그 이름을 새로 만들고 구멍 뒤 노드는 계획 밖에 남는다
+    expected = [vm_mod.node_name(i) for i in range(1, len(existing) + 1)]
+    if existing and existing != expected:
+        if vm_mod.node_name(1) not in existing:
+            headline = f"this cluster has no server VM ({vm_mod.node_name(1)})"
+            detail = [
+                f"Found {', '.join(existing)} — agents whose server is gone.",
+                "A new server would issue a new join token these agents do not",
+                "know; they would retry against the old one forever.",
+            ]
+        else:
+            headline = "this cluster's node names have a gap"
+            detail = [
+                f"Found {', '.join(existing)}; expected {', '.join(expected)}.",
+                "Counting by size would rebuild the missing name as a fresh VM",
+                "and leave everything after the gap out of the plan.",
+            ]
+        # 원래 크기는 남은 이름의 최대 번호다 — node-2,3 이 남았으면 3노드
+        # 클러스터였다. len(existing) 을 쓰면 원래보다 작게 복구하라고
+        # 권하게 된다.
+        tails = [n.rsplit("-", 1)[-1] for n in existing]
+        size = max((int(t) for t in tails if t.isdigit()), default=len(existing))
+        _fail(
+            headline,
+            [
+                *detail,
+                "This cannot be healed in place. Take it down and rebuild:",
+                f"    ssherpa down {name}",
+                f"    ssherpa up {name} --vm --nodes {size}",
+            ],
         )
-    )
+
+    # 빈 호스트에서만 고를 일이 생긴다. VM 이 이미 있으면 답은 그 안에
+    # 있다 — 꺼진 VM 안은 볼 수 없으니, server 를 먼저 살린 뒤에 정한다.
+    chosen = None
+    if not existing:
+        chosen = _distro_to_install(node_host, requested, installed=[], vm=True)
+
+    console.print()
+    what = "a VM" if nodes == 1 else f"{nodes} VMs"
+    if chosen is not None:
+        banner = f"Installing [bold]{chosen.name}[/bold] on {what} on [bold]{name}[/bold]"
+    else:
+        what = "the VM" if nodes == 1 else f"{nodes} VMs"
+        banner = f"Bringing up {what} on [bold]{name}[/bold]"
+    console.print(Padding(banner, (0, 0, 0, 2)))
     console.print()
 
     reporter = StepReporter(console)
     with _surface_errors():
         foundation = virt.setup(target, reporter)
 
-        # 만들기 전에 거절한다. 절반쯤 만들다 메모리가 떨어지면 사용자에게는
-        # 지워야 할 VM 몇 대와 이유 모를 실패만 남는다. doctor 가 보여주는
-        # 것과 같은 계산이라 안내와 결과가 어긋나지 않는다.
-        capacity = foundation.vm_capacity
-        if capacity is not None and nodes > capacity:
-            _fail(
-                f"this host fits about {capacity} VM(s), but {nodes} were asked for",
-                [
-                    f"Each node takes {vm_mod.PER_VM_MB // 1024} GB, and the host "
-                    "keeps some for itself.",
-                    f"Try --nodes {capacity}, or add memory to the host.",
-                    f"See the estimate:  ssherpa doctor {name}",
-                ],
-            )
+        def check_fit(distro):
+            # 만들기 전에 거절한다. 절반쯤 만들다 메모리가 떨어지면
+            # 사용자에게는 지워야 할 VM 몇 대와 이유 모를 실패만 남는다.
+            # VM 크기는 배포판이 정하므로, 배포판이 정해진 뒤에야 셀 수 있다.
+            usable = foundation.usable_memory_mb
+            size_gb = distro.vm_memory_mb // 1024
+            if usable is not None:
+                capacity = usable // distro.vm_memory_mb
+                if nodes > capacity:
+                    _fail(
+                        f"this host fits about {capacity} {distro.name} VM(s) "
+                        f"({size_gb} GB each), but {nodes} were asked for",
+                        [
+                            f"Each {distro.name} node takes {size_gb} GB, and "
+                            "the host keeps some for itself.",
+                            f"Try --nodes {capacity}, or add memory to the host.",
+                            f"See the estimate:  ssherpa doctor {name}",
+                        ],
+                    )
+            # 디스크는 얇은 파일이라 당장 다 차지하지는 않지만, 자라면
+            # 이 크기까지 간다. 막지 않고 말해둔다 — 가득참은 스냅샷이
+            # 반쯤 쓰이다 깨지는 최악의 실패 양상이다.
+            new_count = nodes - len(existing)
+            free = foundation.disk_free_gb
+            if free is not None and new_count > 0:
+                growth = new_count * distro.vm_disk_gb
+                if growth > free:
+                    console.print(
+                        Padding(
+                            f"[yellow]Note: these VMs can grow to {growth} GB of "
+                            f"disk; the host has {free:.0f} GB free.[/yellow]",
+                            (0, 0, 0, 2),
+                        )
+                    )
 
         def build(spec, role):
             short = spec.name.removeprefix(vm_mod.VM_PREFIX)
@@ -894,8 +972,39 @@ def _up_vm(
                 short_name=short,
             )
 
-        specs = vm_mod.specs_for(nodes)
-        server_info, server = build(specs[0], "server")
+        if chosen is not None:
+            # 빈 호스트: 크기가 정해졌으니 만들기 전에 감당이 되는지 본다.
+            check_fit(chosen)
+            specs = vm_mod.specs_for(
+                nodes, chosen.vm_memory_mb, chosen.vm_disk_gb
+            )
+            server_info, server = build(specs[0], "server")
+        else:
+            # 이미 있는 클러스터: server 를 살려 안을 들여다본 뒤에 정한다.
+            # 크기 인자는 닿지 않는다 — create 는 있는 VM 을 그대로 쓴다.
+            server_info, server = build(vm_mod.specs_for(nodes)[0], "server")
+            inside = _installed_on(server)
+            chosen = _distro_to_install(
+                server,
+                requested,
+                installed=inside,
+                where="in the VMs on this host",
+                vm=True,
+            )
+            if inside and not requested:
+                console.print(
+                    Padding(
+                        f"[dim]{chosen.name} runs inside these VMs — "
+                        "continuing with it.[/dim]",
+                        (0, 0, 0, 2),
+                    )
+                )
+            # 늘어나는 만큼은 새 VM 이다 — 배포판이 정해졌으니 이제 셀 수 있다.
+            check_fit(chosen)
+            specs = vm_mod.specs_for(
+                nodes, chosen.vm_memory_mb, chosen.vm_disk_gb
+            )
+
         agents = [build(spec, "agent")[1] for spec in specs[1:]]
 
         # 바깥에서 들어오는 길은 server 로만 낸다 — kubectl 이 말을 거는
@@ -1067,38 +1176,37 @@ def status(
                 # 꺼져 있을 때 아무 줄도 나오지 않았다).
                 unreachable = exc.message
 
-    table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
-    table.add_column(no_wrap=True, style="bold")
-    table.add_column(no_wrap=True)
-    table.add_column(overflow="fold")
-    where = " on the host" if vms else ""
-    for entry in host.distros:
-        if not entry.installed:
-            table.add_row(entry.name, "[dim]—[/dim]", f"[dim]not installed{where}[/dim]")
-            continue
-        colour = "green" if entry.running else "yellow"
-        state = entry.service_state or "unknown"
-        table.add_row(entry.name, "[green]✓[/green]", f"installed  [{colour}]{state}[/{colour}]")
-
     console.print()
     console.print(Padding(f"Status of [bold]{name}[/bold]", (0, 0, 0, 2)))
     console.print()
-    console.print(Padding(table, (0, 0, 0, 2)))
-    console.print()
 
-    if vms:
-        for index, (vm_name, state) in enumerate(vms):
-            colour = "green" if state == "running" else "yellow"
-            label = "[dim]vm:[/dim]" if index == 0 else "   "
-            console.print(
-                Padding(
-                    f"{label}  {vm_name}  [{colour}]{state or 'unknown'}[/{colour}]",
-                    (0, 0, 0, 2),
+    # 답부터 말한다. VM 클러스터가 있는 호스트에서 'k3s — not installed'
+    # 두 줄을 먼저 내밀면, 멀쩡히 도는 클러스터 앞에서 아무것도 없다는
+    # 인상을 준다 (실사용 지적). 배포판 표는 호스트에 직접 깔렸거나
+    # VM 이 아예 없을 때만 답이다.
+    if host.installed or not vms:
+        table = Table(
+            box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0)
+        )
+        table.add_column(no_wrap=True, style="bold")
+        table.add_column(no_wrap=True)
+        table.add_column(overflow="fold")
+        where = " on the host" if vms else ""
+        for entry in host.distros:
+            if not entry.installed:
+                table.add_row(
+                    entry.name, "[dim]—[/dim]", f"[dim]not installed{where}[/dim]"
                 )
+                continue
+            colour = "green" if entry.running else "yellow"
+            state = entry.service_state or "unknown"
+            table.add_row(
+                entry.name, "[green]✓[/green]", f"installed  [{colour}]{state}[/{colour}]"
             )
+        console.print(Padding(table, (0, 0, 0, 2)))
         console.print()
 
-    # VM 안에서 도는 클러스터를 한 줄로 요약한다.
+    # VM 안에서 도는 클러스터를 한 줄로 요약한다 — VM 이 있으면 이게 답이다.
     if inside is not None and inside.running:
         running = inside.running[0].name
         ready = inside.ready_count
@@ -1109,6 +1217,31 @@ def status(
             Padding(
                 f"[dim]cluster:[/dim]  {running} in the VMs  "
                 f"[{colour}]{shape}[/{colour}]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
+    elif inside is not None and inside.installed:
+        # 깔려는 있는데 안 돈다 — '없다' 도 '준비됨' 도 아닌 상태를
+        # 그대로 말해야 사용자가 맞는 다음 걸음을 찾는다.
+        entry = inside.installed[0]
+        state = entry.service_state or "not running"
+        console.print(
+            Padding(
+                f"[dim]cluster:[/dim]  {entry.name} in the VMs  "
+                f"[yellow]{state}[/yellow]",
+                (0, 0, 0, 2),
+            )
+        )
+        console.print()
+    elif inside is not None:
+        # VM 은 있는데 안이 비었다 — 만들다 만 상태. 침묵하면
+        # '클러스터가 없다' 로 읽힌다.
+        console.print(
+            Padding(
+                f"[dim]cluster:[/dim]  [yellow]nothing installed in the VMs "
+                f"yet[/yellow]  [dim]ssherpa up {name} --vm finishes the "
+                "job[/dim]",
                 (0, 0, 0, 2),
             )
         )
@@ -1128,9 +1261,62 @@ def status(
         )
         console.print()
 
+    if vms:
+        for index, (vm_name, state) in enumerate(vms):
+            colour = "green" if state == "running" else "yellow"
+            label = "[dim]vm:[/dim]" if index == 0 else "   "
+            console.print(
+                Padding(
+                    f"{label}  {vm_name}  [{colour}]{state or 'unknown'}[/{colour}]",
+                    (0, 0, 0, 2),
+                )
+            )
+        console.print()
+        if not host.installed:
+            # 표를 걷어낸 자리의 정보는 남긴다 — 호스트 직접 설치가
+            # 없다는 사실은 down/up 의 동작을 예측하는 데 쓰인다.
+            console.print(
+                Padding(
+                    "[dim]The host itself has nothing installed — "
+                    "the cluster lives in the VMs.[/dim]",
+                    (0, 0, 0, 2),
+                )
+            )
+            console.print()
+
+    if host.installed and vms:
+        # SSHerpa 는 이 상태를 만들지 않는다 — up 은 양쪽 문에서 거절한다.
+        # 그러니 여기 왔다는 건 누가 손으로 깔았다는 뜻이고, 둘 다 초록불로
+        # 보여주면 6443 을 두고 싸우는 중이라는 사실이 숨는다: 포워딩이
+        # 바깥 트래픽을 VM 으로 보내므로 호스트 쪽 설치는 밖에서 조용히
+        # 끊긴다.
+        err_console.print(
+            Padding(
+                f"[yellow]{host.installed[0].name} on the host and the VM "
+                "cluster both need port 6443.[/yellow]",
+                (0, 0, 0, 2),
+            )
+        )
+        err_console.print()
+        err_console.print(
+            Padding(
+                "The host forwards that port into the VMs, so from outside "
+                "kubectl reaches",
+                (0, 0, 0, 4),
+            )
+        )
+        err_console.print(
+            Padding(
+                f"the VM cluster — the host's {host.installed[0].name} is cut "
+                "off. Start clean:",
+                (0, 0, 0, 4),
+            )
+        )
+        err_console.print(Padding(f"[dim]ssherpa down {name}[/dim]", (0, 0, 0, 8)))
+        err_console.print()
+
     if host.conflicted:
         # 두 배포판이 함께 있으면 둘 다 6443 을 잡으려 해서 나중 것이 못 뜬다.
-        extra = [d.name for d in host.installed if not d.running]
         err_console.print(
             Padding(
                 "[yellow]More than one distribution is installed.[/yellow]",
@@ -1140,14 +1326,29 @@ def status(
         err_console.print()
         err_console.print(
             Padding(
-                "They all bind port 6443, so only one can run. Remove the others:",
+                # down 은 골라서 지우지 않는다 — 찾은 것을 전부 걷는다.
+                # 배포판을 골라 지우라는 안내는 down 에 없는 옵션을 시키는
+                # 것이었다 (--distro 는 up 의 옵션이다).
+                "They all bind port 6443, so only one can run. down removes "
+                "everything",
                 (0, 0, 0, 4),
             )
         )
-        for other in extra or [d.name for d in host.installed[1:]]:
-            err_console.print(
-                Padding(f"[dim]ssherpa down {name} --distro {other}[/dim]", (0, 0, 0, 8))
+        err_console.print(
+            Padding(
+                "it finds — start clean, then put back the one you want:",
+                (0, 0, 0, 4),
             )
+        )
+        err_console.print(Padding(f"[dim]ssherpa down {name}[/dim]", (0, 0, 0, 8)))
+        err_console.print(
+            Padding(
+                # <> 는 자리표시자 관례다 — 따옴표 없는 | 를 그대로 내면
+                # 붙여넣는 순간 셸이 파이프로 읽는다.
+                f"[dim]ssherpa up {name} --distro <{distro_mod.names().replace(', ', '|')}>[/dim]",
+                (0, 0, 0, 8),
+            )
+        )
         err_console.print()
     elif not host.installed and not vms:
         console.print(Padding(f"[dim]Nothing installed.  ssherpa up {name}[/dim]", (0, 0, 0, 2)))

@@ -119,6 +119,12 @@ class TestNodeNaming:
     def test_every_node_carries_the_prefix(self):
         assert all(s.name.startswith(vm.VM_PREFIX) for s in vm.specs_for(5))
 
+    def test_specs_carry_the_distros_sizes(self):
+        # rke2 는 4GB/20GB 짜리 VM 을 요구한다 — 크기가 배포판을 따라간다
+        specs = vm.specs_for(2, memory_mb=4096, disk_gb=20)
+        assert all(s.memory_mb == 4096 for s in specs)
+        assert all(s.disk_gb == 20 for s in specs)
+
     def test_find_defaults_to_the_first_node(self, host):
         # `ssherpa ssh --vm` 은 server 로 들어가야 한다
         fake = host(state="running")
