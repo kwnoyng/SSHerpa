@@ -35,6 +35,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # 태그와 __version__ 이 어긋난 채 나가는 것을 여기서 막는다.
+      # 버전 올리기는 릴리스 절차에서 유일하게 사람이 기억해야 하는
+      # 단계였고, 실제로 잊을 뻔한 적이 있다 — 기억 대신 게이트.
+      - name: tag must match the package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(python -c "import ssherpa; print(ssherpa.__version__)")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag is $GITHUB_REF_NAME but ssherpa.__version__ is $version" >&2
+            echo "bump ssherpa/__init__.py (or retag) before publishing" >&2
+            exit 1
+          fi
       - run: python -m pip install build
       - run: python -m build
       - uses: actions/upload-artifact@v4
